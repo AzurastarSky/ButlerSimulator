@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ButlerSimulator — Local LLM Chat Test</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; margin: 24px; }
+    #chat { width: 100%; max-width: 900px; }
+    textarea { width: 100%; height: 80px; font-size: 14px; }
+    button { padding: 8px 12px; margin-top: 8px; }
+    .message { border-radius: 6px; padding: 10px; margin: 8px 0; }
+    .user { background: #eef; }
+    .assistant { background: #efe; }
+    #status { font-size: 13px; color: #666; margin-top: 8px }
+  </style>
+</head>
+<body>
+  <div id="chat">
+    <h2>ButlerSimulator — Local LLM Chat Test (3B)</h2>
+    <p>Make sure backend is running. Model preloads and warms up automatically on startup.</p>
+
+    <label for="prompt">Message:</label>
+    <textarea id="prompt" placeholder="Ask: What's the temperature in the Living Room?\n"></textarea>
+    <br/>
+    <button id="send">Send (stream)</button>
+    <button id="clear">Clear</button>
+
+    <div id="status">Status: idle</div>
+
+    <div id="history"></div>
+  </div>
+
+<script>
+const sendBtn = document.getElementById('send');
+const clearBtn = document.getElementById('clear');
+const promptEl = document.getElementById('prompt');
+const historyEl = document.getElementById('history');
+const statusEl = document.getElementById('status');
+
+function appendMessage(role, text) {
+  const div = document.createElement('div');
+  div.className = 'message ' + (role === 'user' ? 'user' : 'assistant');
+  div.textContent = (role === 'user' ? 'You: ' : 'Assistant: ') + text;
+  historyEl.appendChild(div);
+  historyEl.scrollTop = historyEl.scrollHeight;
+}
+
+// Single streaming send path
+
+async function streamMessage() {
+  const text = promptEl.value.trim();
+  if (!text) return;
+  appendMessage('user', text);
+  promptEl.value = '';
+  statusEl.textContent = 'Status: streaming...';
+  
+  try {
+    const res = await fetch('http://localhost:8000/api/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text })
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      statusEl.textContent = 'Status: error ' + res.status;
+      appendMessage('assistant', 'Error: ' + errText);
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let assistantDiv = document.createElement('div');
+    assistantDiv.className = 'message assistant';
+    assistantDiv.textContent = 'Assistant: ';
+    historyEl.appendChild(assistantDiv);
+
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      // Process any complete SSE-style data chunks
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop();
+      for (const part of parts) {
+        if (!part) continue;
+        // lines like: data: <payload> or event: done
+        const lines = part.split('\n');
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const payload = line.slice(6);
+            // Ignore the sentinel marker the server emits
+            if (payload === '[DONE]') continue;
+            // If the server returned a stream error, show it as assistant text
+            if (payload.startsWith('[STREAM_ERROR]')) {
+              assistantDiv.textContent += '\n' + payload;
+              statusEl.textContent = 'Status: error';
+              continue;
+            }
+            // Unescape any encoded newlines
+            const textChunk = payload.replace(/\\n/g, '\\n');
+            assistantDiv.textContent += textChunk;
+            historyEl.scrollTop = historyEl.scrollHeight;
+          } else if (line.startsWith('event: ') && line.includes('done')) {
+            // server signalled completion
+            statusEl.textContent = 'Status: done';
+          }
+        }
+      }
+    }
+
+    statusEl.textContent = 'Status: done';
+  } catch (e) {
+    statusEl.textContent = 'Status: network error';
+    appendMessage('assistant', 'Network error: ' + e.message);
+  }
+}
+
+sendBtn.addEventListener('click', streamMessage);
+clearBtn.addEventListener('click', () => { historyEl.innerHTML = ''; statusEl.textContent = 'Status: idle'; });
+
+// Allow Ctrl+Enter to send
+promptEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    streamMessage();
+  }
+});
+</script>
+</body>
+</html>
