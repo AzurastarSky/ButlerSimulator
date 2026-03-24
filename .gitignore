@@ -1,0 +1,18 @@
+# --- Backend secrets & logs ---
+backend/.env
+backend/auto_start.log
+
+# --- Python cache / bytecode (all locations, incl backend) ---
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+
+# --- Virtual environments (only the one inside backend, or all venvs) ---
+backend/butlervenv/
+# Alternatively ignore any venv anywhere:
+# **/venv/
+# **/.venv/
+# **/*venv*/
+
+# --- Optional: ignore Python package metadata ---
+**/*.egg-info/
