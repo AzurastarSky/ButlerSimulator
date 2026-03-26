@@ -53,6 +53,28 @@ footer{text-align:center;color:var(--muted);padding:8px 0 18px;font-size:12px;}
 .tbtn:active{transform:translateY(1px);}
 .sep{width:8px;display:inline-block;}
 
+/* Recorder transcript */
+#stt-transcript{min-height:20px;padding:4px 8px;border-radius:8px;margin-top:6px}
+
+/* Response panels under each model: reserve space to avoid layout shift */
+#resp-local, #resp-cloud{
+  min-height:56px;
+  height:56px;
+  padding:8px 10px;
+  margin:6px 10px;
+  color:var(--muted);
+  font-size:13px;
+  overflow:auto;
+  background:rgba(255,255,255,0.02);
+  border-radius:8px;
+  border:1px solid var(--border);
+}
+
+/* Smaller footprint on very small screens */
+@media (max-width:480px){
+  #resp-local, #resp-cloud{min-height:48px;height:48px;font-size:12px}
+}
+
 /* ---------- Thermostat Bar ---------- */
 .thermo{
   max-width:1100px;

@@ -1,6 +1,5 @@
 # --- Backend secrets & logs ---
-backend/.env
-backend/auto_start.log
+.env
 
 # --- Python cache / bytecode (all locations, incl backend) ---
 **/__pycache__/

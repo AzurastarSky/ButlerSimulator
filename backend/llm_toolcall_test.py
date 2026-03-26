@@ -40,6 +40,11 @@ SYSTEM_PROMPT = """
 You are Butler. Output JSON only.
 When controlling devices, reply:
 {"tool":"manage_device","room":"<living room|dining room|kitchen|bathroom|bedroom|office|all|upstairs|downstairs>","device":"<light|thermostat>","action":"<turn_on|turn_off|toggle|increase|decrease|set_value>","value":"<number optional>"}
+If the user refers to multiple rooms, prefer emitting a `rooms` array instead of a single `room` string. Example for multiple rooms:
+{"tool":"manage_device","rooms":["dining room","kitchen"],"device":"light","action":"turn_on"}
+
+IMPORTANT: For device `light`, only use actions `turn_on`, `turn_off`, or `toggle`.
+Do NOT use `increase` or `decrease` for lights — those are for the thermostat only. If the user says "a bit dim" or similar, emit `turn_on` for the relevant room(s).
 When querying state, reply:
 {"tool":"query_state","room":"<house|living room|dining room|kitchen|bathroom|bedroom|office|all|upstairs|downstairs>","device":"<light|thermostat|all optional>"}
 If no device intent, reply:
@@ -199,12 +204,28 @@ def validate(js: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         return True, None
 
     if tool == "manage_device":
-        room = (js.get("room", "") or "").strip().lower()
+        # Accept either a single room string, a comma/and-separated room list, or a 'rooms' list
+        raw_room = js.get("room", "") or ""
+        room = (raw_room or "").strip().lower()
+        rooms_list = js.get("rooms", None)
+
+        # normalize comma/and separated room strings into a list for validation if provided
+        if isinstance(room, str) and ("," in room or " and " in room):
+            parts = [r.strip().lower() for r in re.split(r",| and ", room) if r.strip()]
+        else:
+            parts = [room] if room else []
+
+        if isinstance(rooms_list, list):
+            list_to_check = [str(r).strip().lower() for r in rooms_list]
+        else:
+            list_to_check = parts
         device = (js.get("device", "") or "").strip().lower()
         action = (js.get("action", "") or "").strip().lower()
 
-        if room not in (VALID_ROOMS - {"house"}):
-            return False, f"invalid room: {room}"
+        # Ensure all specified rooms are valid
+        invalid = [r for r in list_to_check if r and r not in (VALID_ROOMS - {"house"})]
+        if invalid:
+            return False, f"invalid room(s): {invalid}"
 
         if device not in VALID_DEVICES:
             return False, f"invalid device: {device}"
@@ -239,16 +260,34 @@ def infer_thermo_step(user_text: str) -> Optional[float]:
     if not user_text:
         return None
 
-    match = BY_NUMBER.search(user_text)
+    text = (user_text or "").strip()
+
+    # explicit numeric 'by N' first
+    match = BY_NUMBER.search(text)
     if match:
         try:
             return float(match.group(1))
         except Exception:
             pass
 
+    # regex patterns (ordered)
     for pattern, step in INTENSITY_STEPS:
-        if pattern.search(user_text):
-            return step
+        try:
+            if pattern.search(text):
+                return step
+        except Exception:
+            continue
+
+    # Fallback substring checks for common adjectives (catch simple cases)
+    low = text.lower()
+    if any(w in low for w in ("way too", "extremely", "super")):
+        return 4.0
+    if any(w in low for w in ("very", "too", "really")):
+        return 3.0
+    if any(w in low for w in ("quite", "pretty", "fairly", "somewhat")):
+        return 2.0
+    if any(w in low for w in ("a little", "a bit", "slightly", "bit", "little")):
+        return 1.0
 
     return None
 

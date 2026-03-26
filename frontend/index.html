@@ -10,25 +10,19 @@
   <header>
     <h1>Butler — Home</h1>
     <p class="subtitle">2×3 floorplan • Click a room to toggle its light</p>
-
-    <!-- Thermostat bar (house-level) -->
-    <div id="thermo-bar" class="thermo">
-      <div class="thermo-left">
-        <span class="thermo-title">Thermostat</span>
-        <span id="thermo-mode"    class="thermo-chip">—</span>
-        <span id="thermo-current" class="thermo-chip">--.-°C</span>
-        <span id="thermo-target"  class="thermo-chip">--°C</span>
-      </div>
-      <div class="thermo-right">
-        <button class="tbtn" data-thermo="increase">+1°</button>
-        <button class="tbtn" data-thermo="decrease">-1°</button>
-        <button class="tbtn" data-thermo="set" data-value="18">18°</button>
-        <button class="tbtn" data-thermo="set" data-value="20">20°</button>
-        <button class="tbtn" data-thermo="set" data-value="22">22°</button>
-        <button class="tbtn" data-thermo="on">Heat On</button>
-        <button class="tbtn" data-thermo="off">Heat Off</button>
-      </div>
+    <!-- Prompt to send to both LLMs -->
+    <div style="margin-top:10px;">
+      <input id="prompt-input" type="text" placeholder="Type a command (e.g. 'It's a bit dim in the office')" style="width:60%;padding:8px;border-radius:8px;border:1px solid #294160;background:transparent;color:inherit;"> 
+      <button id="prompt-send" class="tbtn">Send to both</button>
     </div>
+    <!-- Voice recorder -->
+    <div style="margin-top:8px;display:flex;align-items:center;justify-content:center;gap:8px;">
+      <button id="rec-start" class="tbtn">Record</button>
+      <button id="rec-stop" class="tbtn" disabled>Stop</button>
+    </div>
+    <div id="stt-transcript" style="margin-top:8px;color:var(--muted);font-size:13px;min-height:20px;text-align:center;"></div>
+
+    <!-- Thermostat bar removed (not used) -->
 
     <!-- Lights toolbar -->
     <div class="toolbar">
@@ -44,10 +38,27 @@
     </div>
   </header>
 
-  <!-- FLOORPLAN GRID (THIS PART WAS MISSING!) -->
-  <main id="floorplan" class="floorplan"></main>
+  <!-- Two floorplans: local vs cloud -->
+  <main style="display:flex;gap:12px;flex-wrap:wrap;justify-content:center;padding:8px;">
+    <section style="flex:1;min-width:320px;max-width:540px;">
+      <h2 style="margin:6px 0 8px 0;text-align:center">Local Model</h2>
+      <div style="text-align:center;margin-bottom:6px;">
+        <span id="thermo-mode-local" class="thermo-chip">—</span>
+        <span id="thermo-target-local" class="thermo-chip">--°C</span>
+      </div>
+      <div id="floorplan-local" class="floorplan"></div>
+    </section>
+    <section style="flex:1;min-width:320px;max-width:540px;">
+      <h2 style="margin:6px 0 8px 0;text-align:center">Cloud Model</h2>
+      <div style="text-align:center;margin-bottom:6px;">
+        <span id="thermo-mode-cloud" class="thermo-chip">—</span>
+        <span id="thermo-target-cloud" class="thermo-chip">--°C</span>
+      </div>
+      <div id="floorplan-cloud" class="floorplan"></div>
+    </section>
+  </main>
 
-  <footer>Auto-refresh every 2s • Pure HTML/CSS/JS</footer>
+  <footer>Updates on change • Pure HTML/CSS/JS</footer>
 
   <script src="app.js"></script>
 </body>
