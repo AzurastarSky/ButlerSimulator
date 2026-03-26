@@ -1,0 +1,194 @@
+:root{
+  --bg:#0b0f14;
+  --panel:#111723;
+  --ink:#e6e9ef;
+  --muted:#9aa4b2;
+  --accent:#66b2ff;
+  --on:#ffd54a;
+  --off:#2a3547;
+  --glow:rgba(255,213,74,.55);
+  --border:#1e2737;
+  --card:#121821;
+}
+
+/* ---------- Base ---------- */
+*{box-sizing:border-box;}
+body{
+  margin:0;
+  background:var(--bg);
+  color:var(--ink);
+  font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Arial;
+}
+header{text-align:center;padding:12px 10px;}
+h1{margin:0;font-size:20px;}
+.subtitle{color:var(--muted);font-size:12px;margin-top:2px;}
+footer{text-align:center;color:var(--muted);padding:8px 0 18px;font-size:12px;}
+
+/* ---------- Toolbar Buttons ---------- */
+.toolbar{
+  display:flex;
+  justify-content:center;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:6px;
+  margin-top:8px;
+}
+.tb-label{
+  font-weight:600;
+  color:var(--muted);
+  margin-right:4px;
+}
+.tbtn{
+  background:#1e2737;
+  border:1px solid #2a3547;
+  border-radius:8px;
+  padding:4px 10px;
+  font-size:12px;
+  font-weight:600;
+  cursor:pointer;
+  color:var(--ink);
+  transition:background .12s ease, transform .06s ease;
+}
+.tbtn:hover{background:#253047;}
+.tbtn:active{transform:translateY(1px);}
+.sep{width:8px;display:inline-block;}
+
+/* ---------- Thermostat Bar ---------- */
+.thermo{
+  max-width:1100px;
+  margin:8px auto 0 auto;
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:8px 10px;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:10px;
+  flex-wrap:wrap;
+}
+.thermo-left{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  flex-wrap:wrap;
+}
+.thermo-title{font-weight:700;font-size:13px;}
+.thermo-chip{
+  background:rgba(255,255,255,.05);
+  border:1px solid var(--border);
+  padding:4px 8px;
+  border-radius:999px;
+  font-size:12px;
+}
+.thermo-right{
+  display:flex;
+  gap:6px;
+  flex-wrap:wrap;
+}
+
+/* ---------- Floorplan Grid ---------- */
+.floorplan{
+  max-width:1100px;
+  margin:8px auto 0 auto;
+  padding:8px 12px 16px;
+  display:grid;
+  gap:10px;
+  grid-template-columns:repeat(3,1fr);
+  grid-template-rows:repeat(2,minmax(110px,1fr));
+}
+
+/* Small screens → stack */
+@media (max-width:900px){
+  .floorplan{
+    grid-template-columns:1fr;
+    grid-template-rows:auto;
+  }
+}
+
+/* ---------- Room Cards ---------- */
+.room{
+  background:var(--card);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:10px;
+  display:flex;
+  flex-direction:column;
+  justify-content:space-between;
+  cursor:pointer;
+  box-shadow:0 6px 16px rgba(0,0,0,.35);
+  transition:transform .08s ease, box-shadow .18s ease;
+}
+.room:hover{
+  transform:translateY(-1px);
+  box-shadow:0 10px 22px rgba(0,0,0,.42);
+}
+.room.active{
+  box-shadow:0 10px 24px rgba(255,213,74,.18),0 10px 20px rgba(0,0,0,.35);
+}
+
+/* ---------- Room Header ---------- */
+.room-header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin-bottom:6px;
+}
+.room-name{
+  font-size:14px;
+  font-weight:700;
+  text-transform:capitalize;
+}
+.room-status{
+  display:flex;
+  align-items:center;
+  gap:6px;
+}
+.badge{
+  width:10px;height:10px;border-radius:50%;
+}
+.badge.on{background:var(--on);box-shadow:0 0 10px var(--glow);}
+.badge.off{background:var(--off);}
+.status-text{
+  font-size:11px;
+  font-weight:600;
+}
+.status-text.on{color:var(--on);}
+.status-text.off{color:var(--muted);}
+
+/* ---------- Device pills ---------- */
+.pills{
+  display:flex;
+  gap:6px;
+  flex-wrap:wrap;
+}
+.device-pill{
+  font-size:11px;
+  padding:3px 8px;
+  border-radius:999px;
+  border:1px solid var(--border);
+  background:rgba(255,255,255,.04);
+  color:var(--muted);
+}
+/* blinds removed */
+
+/* ---------- Buttons inside room ---------- */
+.controls{
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+  margin-top:4px;
+}
+.btn{
+  background:#1e2737;
+  border:1px solid var(--border);
+  border-radius:8px;
+  padding:3px 8px;
+  font-size:11px;
+  font-weight:600;
+  cursor:pointer;
+  color:var(--ink);
+  transition:background .12s ease;
+}
+.btn:hover{background:#253047;}
+.btn:active{transform:translateY(1px);}

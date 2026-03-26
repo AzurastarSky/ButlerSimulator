@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Butler — Home Floorplan</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <h1>Butler — Home</h1>
+    <p class="subtitle">2×3 floorplan • Click a room to toggle its light</p>
+
+    <!-- Thermostat bar (house-level) -->
+    <div id="thermo-bar" class="thermo">
+      <div class="thermo-left">
+        <span class="thermo-title">Thermostat</span>
+        <span id="thermo-mode"    class="thermo-chip">—</span>
+        <span id="thermo-current" class="thermo-chip">--.-°C</span>
+        <span id="thermo-target"  class="thermo-chip">--°C</span>
+      </div>
+      <div class="thermo-right">
+        <button class="tbtn" data-thermo="increase">+1°</button>
+        <button class="tbtn" data-thermo="decrease">-1°</button>
+        <button class="tbtn" data-thermo="set" data-value="18">18°</button>
+        <button class="tbtn" data-thermo="set" data-value="20">20°</button>
+        <button class="tbtn" data-thermo="set" data-value="22">22°</button>
+        <button class="tbtn" data-thermo="on">Heat On</button>
+        <button class="tbtn" data-thermo="off">Heat Off</button>
+      </div>
+    </div>
+
+    <!-- Lights toolbar -->
+    <div class="toolbar">
+      <span class="tb-label">Lights:</span>
+      <button class="tbtn" data-scope="all"        data-device="light" data-action="turn_on">All On</button>
+      <button class="tbtn" data-scope="all"        data-device="light" data-action="turn_off">All Off</button>
+      <span class="sep"></span>
+      <button class="tbtn" data-scope="upstairs"   data-device="light" data-action="turn_on">Upstairs On</button>
+      <button class="tbtn" data-scope="upstairs"   data-device="light" data-action="turn_off">Upstairs Off</button>
+      <span class="sep"></span>
+      <button class="tbtn" data-scope="downstairs" data-device="light" data-action="turn_on">Downstairs On</button>
+      <button class="tbtn" data-scope="downstairs" data-device="light" data-action="turn_off">Downstairs Off</button>
+    </div>
+  </header>
+
+  <!-- FLOORPLAN GRID (THIS PART WAS MISSING!) -->
+  <main id="floorplan" class="floorplan"></main>
+
+  <footer>Auto-refresh every 2s • Pure HTML/CSS/JS</footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
