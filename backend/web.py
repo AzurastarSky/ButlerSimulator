@@ -227,6 +227,158 @@ def _save_chunk_audio(job_id: str, chunk_idx: int, source: str, data: bytes) -> 
         pass
     return str(outp)
 
+
+def _clear_persisted_chunks():
+    """Delete persisted chunk files from disk and clear 'chunks' lists in JOBS.
+
+    This is called when a new TTS streaming request starts so that chunk
+    artifacts from previous sessions don't accumulate indefinitely. It only
+    removes per-sentence chunk files (files with '_chunk' in their name) and
+    clears the corresponding 'chunks' metadata in the in-memory JOBS store.
+    """
+    try:
+        # Determine active job ids to avoid deleting chunks for ongoing jobs
+        with _TTS_JOB_LOCK:
+            active_jobs = set(JOBS.keys())
+
+        # Delete files on disk matching chunk naming pattern only if their
+        # job_id (prefix before first '_') is not in active_jobs.
+        if TTS_OUTPUT_DIR.exists():
+            for p in TTS_OUTPUT_DIR.iterdir():
+                try:
+                    if '_chunk' not in p.name:
+                        continue
+                    # Expect filenames like '<job_id>_chunk{idx}_{source}.mp3'
+                    parts = p.name.split('_')
+                    if not parts:
+                        continue
+                    job_id_in_name = parts[0]
+                    # If the job_id is not currently tracked in JOBS, it's safe to delete
+                    if job_id_in_name and (job_id_in_name not in active_jobs):
+                        p.unlink()
+                except Exception:
+                    pass
+
+        # Clear 'chunks' metadata for jobs that no longer exist in JOBS (defensive)
+        with _TTS_JOB_LOCK:
+            for jid, meta in list(JOBS.items()):
+                if not isinstance(meta, dict):
+                    continue
+                # Keep 'chunks' for active jobs; remove stale empty entries
+                if 'chunks' in meta and not meta.get('chunks'):
+                    try:
+                        meta.pop('chunks', None)
+                        JOBS[jid] = meta
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
+def _delete_job_files(job_id: str) -> dict:
+    """Delete all persisted files (chunks and final) for a specific job_id.
+
+    Returns a summary dict containing counts of deleted files and any errors encountered.
+    """
+    summary = {'deleted': [], 'errors': []}
+    try:
+        if not job_id:
+            summary['errors'].append('no job_id')
+            return summary
+
+        # Delete files on disk that start with the job_id prefix
+        if TTS_OUTPUT_DIR.exists():
+            for p in TTS_OUTPUT_DIR.iterdir():
+                try:
+                    if p.name.startswith(job_id + '_'):
+                        p.unlink()
+                        summary['deleted'].append(str(p))
+                except Exception as e:
+                    summary['errors'].append(f"{p}: {e}")
+
+        # Remove job entry from JOBS under lock
+        with _TTS_JOB_LOCK:
+            if job_id in JOBS:
+                try:
+                    JOBS.pop(job_id, None)
+                except Exception as e:
+                    summary['errors'].append(f"jobs_pop_error: {e}")
+    except Exception as e:
+        summary['errors'].append(str(e))
+    return summary
+
+
+def _purge_old_job_files(except_job_id: str = None) -> dict:
+    """Delete persisted audio files for all jobs except `except_job_id`.
+
+    Returns a summary with lists of deleted files and errors. Also removes
+    corresponding JOBS entries for deleted job ids.
+    """
+    summary = {'deleted': [], 'errors': []}
+    try:
+        # Preserve only the explicit exception job id; delete all other jobs/files.
+        preserved = set()
+        if except_job_id:
+            preserved.add(except_job_id)
+
+        # snapshot existing jobs so we can remove their entries after deleting files
+        with _TTS_JOB_LOCK:
+            existing_jobs = list(JOBS.keys())
+
+        # Delete files on disk that belong to jobs not in `preserved`.
+        # Only delete files for jobs that are not currently pending (to avoid
+        # removing a slow provider's output while another provider already
+        # completed). We consider a job "in-flight" if its 'status' dict
+        # contains any provider marked as 'pending'.
+        #
+        # Snapshot JOBS statuses for decision-making.
+        job_status_snapshot = {}
+        with _TTS_JOB_LOCK:
+            for jid, meta in JOBS.items():
+                try:
+                    job_status_snapshot[jid] = dict(meta.get('status', {}))
+                except Exception:
+                    job_status_snapshot[jid] = {}
+
+        if TTS_OUTPUT_DIR.exists():
+            for p in list(TTS_OUTPUT_DIR.iterdir()):
+                try:
+                    if '_' not in p.name:
+                        continue
+                    job_id_in_name = p.name.split('_', 1)[0]
+                    if not job_id_in_name:
+                        continue
+                    if job_id_in_name in preserved:
+                        continue
+                    # If we have a status snapshot and the job shows any 'pending', skip deletion
+                    sts = job_status_snapshot.get(job_id_in_name, {})
+                    if any(v == 'pending' for v in sts.values()):
+                        continue
+                    # safe to delete
+                    p.unlink()
+                    summary['deleted'].append(str(p))
+                except Exception as e:
+                    summary['errors'].append(f"{p}: {e}")
+
+        # Remove JOBS entries for previously existing jobs that are not preserved
+        # and that are not in-flight (no 'pending' statuses). Keep any in-flight
+        # jobs to avoid disrupting ongoing syntheses.
+        with _TTS_JOB_LOCK:
+            for jid in existing_jobs:
+                if jid in preserved:
+                    continue
+                sts = job_status_snapshot.get(jid, {})
+                if any(v == 'pending' for v in sts.values()):
+                    # Skip removing in-flight job
+                    continue
+                try:
+                    JOBS.pop(jid, None)
+                except Exception as e:
+                    summary['errors'].append(f"jobs_pop_{jid}: {e}")
+    except Exception as e:
+        summary['errors'].append(str(e))
+    return summary
+
 def _split_into_chunks(text: str, min_tokens: int = 5, max_chunks: int = 3):
     """Split text on sentence-ending punctuation but avoid creating too many chunks.
 
@@ -305,10 +457,16 @@ def _start_tts_background(job_id: str, text: str, voice: str = None):
         def run_provider(src, provider):
             t0 = time.time()
             data = None
+            print(f"[TTS BG] starting provider={src} for job={job_id} text_len={len(text)}")
             try:
                 data = provider.synthesize_speech(text, voice=voice)
-            except Exception:
+                print(f"[TTS BG] provider={src} completed synthesis for job={job_id} bytes={len(data) if data else 0}")
+            except Exception as e:
                 data = None
+                try:
+                    print(f"[TTS BG] provider={src} failed for job={job_id}: {repr(e)}")
+                except Exception:
+                    pass
             t1 = time.time()
             dur_ms = int((t1 - t0) * 1000)
             with _TTS_JOB_LOCK:
@@ -323,8 +481,21 @@ def _start_tts_background(job_id: str, text: str, voice: str = None):
                     try:
                         path = _save_job_audio(job_id, src, data)
                         job[f"{src}_path"] = path
+                        # Also store the raw bytes for diagnostics
+                        try:
+                            job[f"{src}_bytes"] = data
+                        except Exception:
+                            pass
+                        try:
+                            size = os.path.getsize(path) if os.path.exists(path) else None
+                            print(f"[TTS BG] saved job={job_id} src={src} path={path} size={size}")
+                        except Exception:
+                            pass
                     except Exception:
-                        pass
+                        try:
+                            print(f"[TTS BG] failed to save job={job_id} src={src}")
+                        except Exception:
+                            pass
                     job['status'][src] = 'done'
                 else:
                     job[src] = None
@@ -797,6 +968,8 @@ def api_tts_start():
         }
 
     try:
+        # Purge persisted files from previous jobs, but keep the new job id safe.
+        _purge_old_job_files(except_job_id=job_id)
         _start_tts_background(job_id, text, voice=voice)
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
@@ -958,7 +1131,10 @@ def api_tts_stream_sentences():
     }
 
     def gen():
+        # Generate a run id for this streaming request and purge previous job
+        # files while preserving any files that match this new run id.
         run_id = uuid.uuid4().hex
+        _purge_old_job_files(except_job_id=run_id)
         parts = []
         ttfa_ms = None
         t_start = time.perf_counter()
@@ -1030,6 +1206,10 @@ def api_tts_stream_sentences():
                     job = JOBS.get(run_id) or {}
                     job.setdefault('chunks', []).append(chunk_path)
                     JOBS[run_id] = job
+                try:
+                    print(f"[TTS STREAM] saved chunk run_id={run_id} idx={idx} source={source} path={chunk_path} size={os.path.getsize(chunk_path) if os.path.exists(chunk_path) else 'unknown'}")
+                except Exception:
+                    pass
             except Exception:
                 # non-fatal; continue streaming (chunk save failed)
                 try:
@@ -1066,6 +1246,10 @@ def api_tts_stream_sentences():
                 JOBS[run_id][f"{source}_bytes"] = full
                 JOBS[run_id][source] = full
                 JOBS[run_id]['status'] = {source: 'done'}
+            try:
+                print(f"[TTS STREAM] saved final run_id={run_id} source={source} path={save_path} size={os.path.getsize(save_path) if os.path.exists(save_path) else len(full)}")
+            except Exception:
+                pass
         except Exception:
             yield sse_format('app_error', {'message': 'Failed to persist final audio'})
 
@@ -1228,6 +1412,21 @@ def api_tts_summarize():
         summary = 'Okay — I performed the requested action.'
 
     return jsonify({'ok': True, 'summary': summary})
+
+
+@app.route('/api/tts/clear_job', methods=['POST'])
+def api_tts_clear_job():
+    """Delete persisted audio files and JOBS entry for a given job_id.
+
+    Request JSON: {"job_id": "..."}
+    """
+    data = request.get_json(force=True) or {}
+    job_id = data.get('job_id') or data.get('id')
+    if not job_id:
+        return jsonify({'ok': False, 'error': 'job_id required'}), 400
+
+    res = _delete_job_files(str(job_id))
+    return jsonify({'ok': True, 'job_id': job_id, 'deleted': res.get('deleted', []), 'errors': res.get('errors', [])})
 
 
 
