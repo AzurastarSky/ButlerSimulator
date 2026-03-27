@@ -653,9 +653,10 @@ function composeSummary(parsed, applied, content){
         if (act === 'turn_off') return `Okay — I've turned the thermostat off.`;
       }
 
-      // Device-specific (lights/blinds)
+      // Device-specific (lights)
       if (applied.ok && (applied.device === 'light' || applied.device === 'blinds')){
-        const dev = applied.device === 'light' ? 'light' : 'blinds';
+        // Treat any legacy 'blinds' mentions as 'light' (blinds removed server-side)
+        const dev = (applied.device === 'light' || applied.device === 'blinds') ? 'light' : applied.device;
         const act = applied.action || '';
         if (applied.bulk && Array.isArray(applied.applied)){
           const rooms = applied.applied.map(r=> (r.room ? titleCase(r.room) : '')).filter(Boolean);

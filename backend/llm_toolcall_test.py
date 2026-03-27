@@ -1,6 +1,23 @@
 from typing import Any, Dict, List, Optional, Tuple
 import json, re, requests
 
+# Try to import shared helpers (room/device synonyms + normalizers)
+try:
+    from .helpers import norm_room, norm_device, ROOM_SYNONYMS, DEVICE_SYNONYMS, VALID_ROOMS, VALID_DEVICES
+except Exception:
+    try:
+        from helpers import norm_room, norm_device, ROOM_SYNONYMS, DEVICE_SYNONYMS, VALID_ROOMS, VALID_DEVICES
+    except Exception:
+        # Fallbacks if helpers not importable (very defensive)
+        ROOM_SYNONYMS = {}
+        DEVICE_SYNONYMS = {}
+        def norm_room(v: str) -> str:
+            return (v or "").strip().lower()
+        def norm_device(v: str) -> str:
+            return (v or "").strip().lower()
+        VALID_ROOMS = set()
+        VALID_DEVICES = set()
+
 # ---------------- Config ----------------
 # LLM_SERVER_URL = "http://192.168.0.222:8080/v1/chat/completions"
 LLM_SERVER_URL = "http://192.168.1.245:8080/v1/chat/completions"
@@ -13,28 +30,6 @@ DEBUG = False
 MAX_HISTORY = 8
 TIMEOUT = (10, 60)
 
-ROOM_SYNONYMS: Dict[str, str] = {
-    "lounge": "living room",
-    "livingroom": "living room",
-    "lr": "living room",
-    "diner": "dining room",
-    "kit": "kitchen",
-    "whole house": "house",
-    "entire house": "house",
-    "house": "house",
-    "all rooms": "all",
-    "everywhere": "all",
-    "down stairs": "downstairs",
-    "ground floor": "downstairs",
-    "first floor": "upstairs",
-    "upper floor": "upstairs",
-}
-
-DEVICE_SYNONYMS: Dict[str, str] = {
-    "lamp": "light",
-    "lights": "light",
-    "ceiling light": "light",
-}
 
 SYSTEM_PROMPT = """
 You are Butler. Only use JSON tool outputs for the following two supported tools: `manage_device` and `query_state`.
@@ -66,24 +61,11 @@ User: tell me a 100 word story
 Respond with a plain natural-language story. Do NOT include the words "Plain text", "not JSON", or any formatting hints in your reply. Never echo prompt examples or formatting instructions verbatim.
 """
 
-VALID_ROOMS = {
-    "living room",
-    "dining room",
-    "kitchen",
-    "bathroom",
-    "bedroom",
-    "office",
-    "all",
-    "upstairs",
-    "downstairs",
-    "house",
-}
-
-VALID_DEVICES = {"light", "thermostat"}
+# VALID_ROOMS and VALID_DEVICES are imported from helpers
 
 VALID_ACTIONS = {
     "light": {"turn_on", "turn_off", "toggle"},
-    # blinds removed from setup; keep thermostat and light
+    # blinds removed from setup — only thermostat and light supported
     "thermostat": {"increase", "decrease", "set_value", "turn_on", "turn_off"},
 }
 
@@ -122,19 +104,10 @@ COLD_WORDS = {
 }
 
 
-def dprint(*args: Any) -> None:
-    if DEBUG:
-        print(*args)
+# debug print helper removed (unused) — use logging if needed
 
 
-def norm_room(value: str) -> str:
-    value = (value or "").strip().lower()
-    return ROOM_SYNONYMS.get(value, value)
-
-
-def norm_device(value: str) -> str:
-    value = (value or "").strip().lower()
-    return DEVICE_SYNONYMS.get(value, value)
+# norm_room and norm_device imported from helpers
 
 
 def post_chat(history: List[Dict[str, str]]) -> Dict[str, Any]:

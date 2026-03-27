@@ -25,16 +25,16 @@ app = Flask(__name__, static_folder="../frontend", static_url_path="")
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
 # ---------------- In-memory State ----------------
-# Rooms: lights + blinds
+# Rooms: lights only (blinds removed)
 STATE = {
     # Downstairs
-    "living room": {"light": "off", "blinds": "closed"},
-    "dining room": {"light": "off", "blinds": "closed"},
-    "kitchen":     {"light": "off", "blinds": "closed"},
+    "living room": {"light": "off"},
+    "dining room": {"light": "off"},
+    "kitchen":     {"light": "off"},
     # Upstairs
-    "bathroom": {"light": "off", "blinds": "closed"},
-    "bedroom":  {"light": "off", "blinds": "closed"},
-    "office":   {"light": "off", "blinds": "closed"},
+    "bathroom": {"light": "off"},
+    "bedroom":  {"light": "off"},
+    "office":   {"light": "off"},
 }
 
 # House thermostat (single, house-level)
@@ -120,25 +120,24 @@ except Exception:
     pass
 
 VALID_LIGHT_ACTIONS  = {"turn_on", "turn_off", "toggle"}
-VALID_BLINDS_ACTIONS = {"open", "close", "toggle"}
 VALID_THERMO_ACTIONS = {"increase", "decrease", "set_value", "turn_on", "turn_off"}
 
 DOWNSTAIRS = {"living room", "dining room", "kitchen"}
 UPSTAIRS   = {"bathroom", "bedroom", "office"}
 
-ROOM_SYNONYMS = {
-    "lounge": "living room", "livingroom": "living room", "lr": "living room",
-    "diner": "dining room", "kit": "kitchen",
-    # scopes
-    "whole house": "all", "entire house": "all", "all rooms": "all", "everywhere": "all",
-    "down stairs": "downstairs", "ground floor": "downstairs",
-    "first floor": "upstairs", "upper floor": "upstairs",
-    "house": "all",  # allow "house" to mean whole house
-}
-DEVICE_SYNONYMS = {
-    "lamp": "light", "lights": "light", "ceiling light": "light",
-    "blind": "blinds", "shade": "blinds", "shades": "blinds",
-}
+try:
+    from .helpers import ROOM_SYNONYMS, DEVICE_SYNONYMS, norm_room, norm_device, VALID_ROOMS, VALID_DEVICES, clamp
+except Exception:
+    try:
+        from helpers import ROOM_SYNONYMS, DEVICE_SYNONYMS, norm_room, norm_device, VALID_ROOMS, VALID_DEVICES, clamp
+    except Exception:
+        ROOM_SYNONYMS = {}
+        DEVICE_SYNONYMS = {}
+        def norm_room(v: str) -> str: return (v or "").strip().lower()
+        def norm_device(v: str) -> str: return (v or "").strip().lower()
+        VALID_ROOMS = set()
+        VALID_DEVICES = set()
+        def clamp(v: float, lo: float, hi: float) -> float: return max(lo, min(hi, v))
 
 # OpenAI config (optional)
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
@@ -514,16 +513,7 @@ def _start_tts_background(job_id: str, text: str, voice: str = None):
     t = threading.Thread(target=work, daemon=True)
     t.start()
 
-def norm_room(name: str) -> str:
-    n = (name or "").strip().lower()
-    return ROOM_SYNONYMS.get(n, n)
-
-def norm_device(name: str) -> str:
-    n = (name or "").strip().lower()
-    return DEVICE_SYNONYMS.get(n, n)
-
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
+ # Normalizers and clamp are provided by `helpers.py` import above.
 
 def _update_house_temp():
     # No longer tracking a simulated 'current' temperature.
@@ -624,8 +614,8 @@ def device():
             pass
         return jsonify({"ok": True, "device": "thermostat", "action": action, "house": HOUSE})
 
-    # ------- Lights / Blinds (room or scoped) -------
-    if device not in {"light", "blinds"}:
+    # ------- Lights (room or scoped) -------
+    if device not in {"light"}:
         return jsonify({"ok": False, "error": f"Unsupported device: {device}"}), 400
 
     # Allow helper autocorrections (maps brightness/intents and increase/decrease for lights)
@@ -646,7 +636,7 @@ def device():
     except Exception:
         pass
 
-    valid_actions = VALID_LIGHT_ACTIONS if device == "light" else VALID_BLINDS_ACTIONS
+    valid_actions = VALID_LIGHT_ACTIONS
     if action not in valid_actions:
         return jsonify({"ok": False, "error": f"Unknown action: {action}"}), 400
 
@@ -660,14 +650,9 @@ def device():
                 skipped.append(r)
                 continue
             cur = STATE[r][device]
-            if device == "light":
-                new_state = ("on" if action == "turn_on"
-                             else "off" if action == "turn_off"
-                             else ("off" if cur == "on" else "on"))
-            else:  # blinds
-                new_state = ("open" if action == "open"
-                             else "closed" if action == "close"
-                             else ("closed" if cur == "open" else "open"))
+            new_state = ("on" if action == "turn_on"
+                         else "off" if action == "turn_off"
+                         else ("off" if cur == "on" else "on"))
             STATE[r][device] = new_state
             # Mirror into per-model stores if they have the room/device
             try:
@@ -698,14 +683,9 @@ def device():
         return jsonify({"ok": False, "error": f"Unsupported room/device. Known rooms: {list(STATE.keys())}"}), 400
 
     cur = STATE[room][device]
-    if device == "light":
-        new_state = ("on" if action == "turn_on"
-                     else "off" if action == "turn_off"
-                     else ("off" if cur == "on" else "on"))
-    else:  # blinds
-        new_state = ("open" if action == "open"
-                     else "closed" if action == "close"
-                     else ("closed" if cur == "open" else "open"))
+    new_state = ("on" if action == "turn_on"
+                 else "off" if action == "turn_off"
+                 else ("off" if cur == "on" else "on"))
     STATE[room][device] = new_state
     # Mirror single-room change to local/cloud if present
     try:
@@ -768,26 +748,6 @@ def api_stt():
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 
-@app.route('/api/stt/warmup', methods=['POST', 'GET'])
-def api_stt_warmup():
-    """Warm up SSH connection and optionally run a dummy inference to warm model."""
-    if stt_provider is None:
-        return jsonify({'ok': False, 'error': 'local STT provider not configured'}), 500
-
-    ok_conn = False
-    ok_model = False
-    try:
-        ok_conn = stt_provider.warmup_connections()
-    except Exception as e:
-        print(f"[web] STT warmup connections failed: {e}")
-
-    try:
-        ok_model = stt_provider.warmup_model()
-    except Exception as e:
-        print(f"[web] STT warmup model failed: {e}")
-
-    return jsonify({'ok': True, 'connections_ready': ok_conn, 'model_warmed': ok_model})
-
 
 @app.route('/api/stt/cloud', methods=['POST'])
 def api_stt_cloud():
@@ -840,107 +800,12 @@ def api_stt_cloud():
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 
-@app.route('/api/stt/start', methods=['POST'])
-def api_stt_start():
-    """Start SenseVoice server on remote board. Accepts optional JSON {"force": true} to kill existing instances first."""
-    if stt_provider is None:
-        return jsonify({'ok': False, 'error': 'local STT provider not configured'}), 500
-
-    data = request.get_json(silent=True) or {}
-    force = bool(data.get('force'))
-    # Provider may be HTTP-only and not support server lifecycle management
-    if not hasattr(stt_provider, 'start_server'):
-        return jsonify({'ok': False, 'error': 'server management not available; start SenseVoice manually on the device (e.g. 192.168.1.245:4500)'}), 501
-    res = stt_provider.start_server(force=force)
-    return jsonify(res)
 
 
-@app.route('/api/stt/stop', methods=['POST', 'GET'])
-def api_stt_stop():
-    """Stop SenseVoice server on remote board (kills all matching processes)."""
-    if stt_provider is None:
-        return jsonify({'ok': False, 'error': 'local STT provider not configured'}), 500
-
-    if not hasattr(stt_provider, 'stop_server'):
-        return jsonify({'ok': False, 'error': 'server management not available; stop SenseVoice manually on the device'}), 501
-    res = stt_provider.stop_server()
-    return jsonify(res)
 
 
-@app.route('/api/stt/status', methods=['GET'])
-def api_stt_status():
-    """Return whether SenseVoice server appears to be running and any PIDs."""
-    if stt_provider is None:
-        return jsonify({'ok': False, 'error': 'local STT provider not configured'}), 500
 
-    # Minimal provider may not support process inspection; fall back to HTTP health check
-    proc = {'running': None, 'pids': []}
-    try:
-        http_ok = stt_provider.check_sensevoice_health()
-    except Exception:
-        http_ok = False
-
-    out = {'ok': True, 'proc': proc, 'http_ok': bool(http_ok)}
-    out.update({'running': bool(http_ok), 'pids': []})
-    return jsonify(out)
-
-
-@app.route('/api/stt/logs', methods=['GET'])
-def api_stt_logs():
-    """Return tail of remote SenseVoice server log. Query: ?lines=200"""
-    if stt_provider is None:
-        return jsonify({'ok': False, 'error': 'local STT provider not configured'}), 500
-    try:
-        lines = int(request.args.get('lines', '200'))
-    except Exception:
-        lines = 200
-
-    if not hasattr(stt_provider, 'fetch_remote_log'):
-        return jsonify({'ok': False, 'error': 'remote log access not available (provider is HTTP-only)'}), 501
-
-    try:
-        res = stt_provider.fetch_remote_log(lines=lines)
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
-
-    if not res.get('ok'):
-        return jsonify({'ok': False, 'error': res.get('error', 'unknown')}), 500
-    # Return log as plain text for convenience
-    return Response(res.get('log', ''), mimetype='text/plain')
-
-
-@app.route('/api/stt/netstat', methods=['GET'])
-def api_stt_netstat():
-    """Return remote listening sockets (ss/netstat) to help debug binding/ports."""
-    if stt_provider is None:
-        return jsonify({'ok': False, 'error': 'local STT provider not configured'}), 500
-    try:
-        res = stt_provider.fetch_listening_sockets()
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
-
-    if not res.get('ok'):
-        return jsonify({'ok': False, 'error': res.get('error', 'unknown')}), 500
-    return Response(res.get('out', '') + "\n" + (res.get('err') or ''), mimetype='text/plain')
-
-
-@app.route('/api/stt/start_probe', methods=['POST'])
-def api_stt_start_probe():
-    """Start the SenseVoice server briefly on the remote board and return captured startup output."""
-    if stt_provider is None:
-        return jsonify({'ok': False, 'error': 'local STT provider not configured'}), 500
-    data = request.get_json(silent=True) or {}
-    timeout = int(data.get('timeout', 6))
-    if not hasattr(stt_provider, 'start_server_probe'):
-        return jsonify({'ok': False, 'error': 'start_probe not available (provider is HTTP-only)'}), 501
-    try:
-        res = stt_provider.start_server_probe(timeout=timeout)
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
-
-    if not res.get('ok'):
-        return jsonify({'ok': False, 'error': res.get('error', 'unknown')}), 500
-    return Response(res.get('log', ''), mimetype='text/plain')
+# Removed unused STT admin/debug endpoints to reduce clutter.
 
 
 @app.route('/api/tts', methods=['POST'])
@@ -1069,29 +934,7 @@ def api_tts_status():
     return jsonify({'ok': True, 'job': out})
 
 
-@app.route('/api/tts/jobs', methods=['GET'])
-def api_tts_jobs():
-    """Debug endpoint: list current JOBS keys and sizes for inspection."""
-    out = {}
-    with _TTS_JOB_LOCK:
-        for k, v in JOBS.items():
-            try:
-                local_bytes = len(v.get('local', b'')) if isinstance(v.get('local', b''), (bytes, bytearray)) else None
-            except Exception:
-                local_bytes = None
-            try:
-                cloud_bytes = len(v.get('cloud', b'')) if isinstance(v.get('cloud', b''), (bytes, bytearray)) else None
-            except Exception:
-                cloud_bytes = None
-            out[k] = {
-                'status': v.get('status'),
-                'local_bytes': local_bytes,
-                'cloud_bytes': cloud_bytes,
-                'local_path': v.get('local_path'),
-                'cloud_path': v.get('cloud_path'),
-                'chunks': v.get('chunks')
-            }
-    return jsonify({'ok': True, 'jobs': out})
+# Removed debug TTS jobs endpoint (unused by frontend)
 
 
 @app.route('/api/tts/stream_sentences', methods=['POST'])
@@ -1414,19 +1257,7 @@ def api_tts_summarize():
     return jsonify({'ok': True, 'summary': summary})
 
 
-@app.route('/api/tts/clear_job', methods=['POST'])
-def api_tts_clear_job():
-    """Delete persisted audio files and JOBS entry for a given job_id.
-
-    Request JSON: {"job_id": "..."}
-    """
-    data = request.get_json(force=True) or {}
-    job_id = data.get('job_id') or data.get('id')
-    if not job_id:
-        return jsonify({'ok': False, 'error': 'job_id required'}), 400
-
-    res = _delete_job_files(str(job_id))
-    return jsonify({'ok': True, 'job_id': job_id, 'deleted': res.get('deleted', []), 'errors': res.get('errors', [])})
+# Removed TTS clear_job admin endpoint (unused by frontend)
 
 
 
@@ -1503,13 +1334,7 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
         result['result'] = data
         return result
 
-    # Map blinds to light if needed (frontend no longer has blinds)
-    if device == "blinds":
-        device = "light"
-        if action == "open":
-            action = "turn_on"
-        elif action == "close":
-            action = "turn_off"
+    # Blinds have been removed from the model; treat only lights here
 
     # Thermostat applied to house_store
     if device == "thermostat":
@@ -1661,70 +1486,7 @@ def post_chat_openai(history: list) -> dict:
 
 
 @app.post('/api/chat/dual')
-def api_chat_dual():
-    """POST endpoint to send same prompt/history to both local and cloud LLMs and return both results with timings."""
-    data = request.get_json(force=True) or {}
-    history = data.get('history') or data.get('messages') or []
-    user = data.get('user')
-    if user and not history:
-        history = [{"role": "user", "content": user}]
-
-    results = {}
-    start = time.time()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-        futures = {}
-        if local_llm:
-            futures[ex.submit(local_llm.post_chat, history)] = 'local'
-        else:
-            results['local'] = {"ok": False, "error": "no local LLM available", "ms": None}
-
-        if OPENAI_KEY:
-            futures[ex.submit(post_chat_openai, history)] = 'cloud'
-        else:
-            results['cloud'] = {"ok": False, "error": "OPENAI_API_KEY not set", "ms": None}
-
-        for fut in concurrent.futures.as_completed(futures):
-            who = futures[fut]
-            t = time.time() - start
-            try:
-                resp = fut.result()
-            except Exception as e:
-                results[who] = {"ok": False, "error": str(e), "ms": int(t*1000)}
-                continue
-            # extract assistant content (use llm_helper for generic parsing)
-            try:
-                if who == 'local' and local_llm:
-                    content = local_llm.get_message_content(resp)
-                elif llm_helper:
-                    content = llm_helper.get_message_content(resp)
-                else:
-                    content = resp.get('choices', [])[0].get('message', {}).get('content', '')
-            except Exception:
-                content = ''
-
-            # parse JSON and optionally apply (use llm_helper.extract_json when available)
-            parsed = None
-            applied = None
-            try:
-                parsed = llm_helper.extract_json(content) if llm_helper else None
-            except Exception:
-                parsed = None
-
-            if parsed:
-                last_text = history[-1]['content'] if history else (user or '')
-                applied = apply_toolcall(parsed, target=who, last_user_text=last_text)
-
-            results[who] = {"ok": True, "resp": resp, "content": content, "parsed": parsed, "applied": applied, "ms": int(t*1000)}
-
-    # determine first
-    times = []
-    for k, v in results.items():
-        if k not in ('local', 'cloud'): continue
-        ms = v.get('ms')
-        ms = ms if isinstance(ms, int) else 999999
-        times.append((k, ms))
-    first = min(times, key=lambda x: x[1])[0] if times else None
-    return jsonify({"results": results, "first": first})
+# Removed chat dual endpoint (unused by frontend)
 
 
 @app.post('/api/chat/local')
