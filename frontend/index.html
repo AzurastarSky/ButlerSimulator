@@ -21,6 +21,7 @@
       <button id="rec-stop" class="tbtn" disabled>Stop</button>
     </div>
     <div id="stt-transcript" style="margin-top:8px;color:var(--muted);font-size:13px;min-height:20px;text-align:center;"></div>
+    
 
     <!-- Thermostat bar removed (not used) -->
 
@@ -43,17 +44,25 @@
     <section style="flex:1;min-width:320px;max-width:540px;">
       <h2 style="margin:6px 0 8px 0;text-align:center">Local Model</h2>
       <div style="text-align:center;margin-bottom:6px;">
+        <div id="tts-timings-local" style="font-size:12px;color:var(--muted);margin-bottom:4px;min-height:16px;"></div>
         <span id="thermo-mode-local" class="thermo-chip">—</span>
         <span id="thermo-target-local" class="thermo-chip">--°C</span>
       </div>
+        <div style="text-align:center;margin-bottom:8px;">
+          <audio id="player-local" controls style="width:90%;max-width:420px;margin:6px auto 0;display:block;"></audio>
+        </div>
       <div id="floorplan-local" class="floorplan"></div>
     </section>
     <section style="flex:1;min-width:320px;max-width:540px;">
       <h2 style="margin:6px 0 8px 0;text-align:center">Cloud Model</h2>
       <div style="text-align:center;margin-bottom:6px;">
+        <div id="tts-timings-cloud" style="font-size:12px;color:var(--muted);margin-bottom:4px;min-height:16px;"></div>
         <span id="thermo-mode-cloud" class="thermo-chip">—</span>
         <span id="thermo-target-cloud" class="thermo-chip">--°C</span>
       </div>
+        <div style="text-align:center;margin-bottom:8px;">
+          <audio id="player-cloud" controls style="width:90%;max-width:420px;margin:6px auto 0;display:block;"></audio>
+        </div>
       <div id="floorplan-cloud" class="floorplan"></div>
     </section>
   </main>

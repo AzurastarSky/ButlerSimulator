@@ -9,6 +9,7 @@ import concurrent.futures
 import copy
 import queue
 import threading
+import uuid
 
 app = Flask(__name__, static_folder="../frontend", static_url_path="")
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
@@ -161,6 +162,98 @@ except Exception:
     except Exception as e:
         stt_provider = None
         print(f"[web] local STT provider not available: {e}")
+
+# Optional local TTS provider (Paroli)
+try:
+    from .providers import local_paroli_tts as local_tts_provider
+except Exception:
+    try:
+        from providers import local_paroli_tts as local_tts_provider
+    except Exception as e:
+        local_tts_provider = None
+        print(f"[web] local Paroli TTS provider not available: {e}")
+
+# Optional cloud TTS provider (OpenAI tts-1)
+try:
+    from .providers import openai_tts as cloud_tts_provider
+except Exception:
+    try:
+        from providers import openai_tts as cloud_tts_provider
+    except Exception as e:
+        cloud_tts_provider = None
+        print(f"[web] cloud TTS provider not available: {e}")
+
+# Directory to persist TTS audio files
+TTS_OUTPUT_DIR = Path(__file__).resolve().parent / "tts_output"
+_TTS_JOB_LOCK = threading.Lock()
+# JOBS: job_id -> {text, local: bytes|None, cloud: bytes|None, status}
+JOBS = {}
+
+def _ensure_tts_output_dir():
+    try:
+        TTS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+def _save_job_audio(job_id: str, source: str, data: bytes) -> str:
+    """Save bytes to disk under TTS_OUTPUT_DIR and return relative path."""
+    _ensure_tts_output_dir()
+    fname = f"{job_id}_{source}.mp3"
+    outp = TTS_OUTPUT_DIR / fname
+    try:
+        with open(outp, "wb") as f:
+            f.write(data)
+    except Exception:
+        pass
+    return str(outp)
+
+def _start_tts_background(job_id: str, text: str, voice: str = None):
+    """Run local and cloud TTS in background and populate JOBS entry."""
+    def work():
+        # synthesize local/cloud and record timings
+        def run_provider(src, provider):
+            t0 = time.time()
+            data = None
+            try:
+                data = provider.synthesize_speech(text, voice=voice)
+            except Exception:
+                data = None
+            t1 = time.time()
+            dur_ms = int((t1 - t0) * 1000)
+            with _TTS_JOB_LOCK:
+                job = JOBS.get(job_id) or {}
+                job.setdefault('text', text)
+                job.setdefault('created_at', time.time())
+                job.setdefault('status', {})
+                job.setdefault('timings', {})
+                job['timings'][src] = {'start_ms': int(t0*1000), 'end_ms': int(t1*1000), 'duration_ms': dur_ms}
+                if data:
+                    job[src] = data
+                    try:
+                        path = _save_job_audio(job_id, src, data)
+                        job[f"{src}_path"] = path
+                    except Exception:
+                        pass
+                    job['status'][src] = 'done'
+                else:
+                    job[src] = None
+                    job['status'][src] = 'failed'
+                JOBS[job_id] = job
+
+        # Run both in parallel and fill JOBS when ready
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            futures = {}
+            if local_tts_provider:
+                futures[ex.submit(run_provider, 'local', local_tts_provider)] = 'local'
+            if cloud_tts_provider:
+                futures[ex.submit(run_provider, 'cloud', cloud_tts_provider)] = 'cloud'
+
+            # wait for completions so timings are recorded; results handled in run_provider
+            for fut in concurrent.futures.as_completed(futures):
+                _ = futures.get(fut)
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
 
 def norm_room(name: str) -> str:
     n = (name or "").strip().lower()
@@ -659,6 +752,229 @@ def api_stt_start_probe():
     if not res.get('ok'):
         return jsonify({'ok': False, 'error': res.get('error', 'unknown')}), 500
     return Response(res.get('log', ''), mimetype='text/plain')
+
+
+@app.route('/api/tts', methods=['POST'])
+def api_tts_start():
+    """Start a TTS race job. Returns job id and URLs for streaming / files.
+
+    Request JSON: {"text": "...", "voice": "sage"}
+    """
+    data = request.get_json(force=True) or {}
+    text = (data.get('text') or '')
+    if not text:
+        return jsonify({'ok': False, 'error': 'no text provided'}), 400
+    voice = data.get('voice')
+    job_id = uuid.uuid4().hex
+    with _TTS_JOB_LOCK:
+        JOBS[job_id] = {'text': text, 'created_at': time.time(), 'status': {}}
+
+    # start background synth
+    try:
+        _start_tts_background(job_id, text, voice=voice)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+    stream_url = f"/api/tts/stream?job_id={job_id}"
+    local_file = f"/api/tts/file/{job_id}?source=local"
+    cloud_file = f"/api/tts/file/{job_id}?source=cloud"
+    return jsonify({'ok': True, 'job_id': job_id, 'stream_url': stream_url, 'files': {'local': local_file, 'cloud': cloud_file}})
+
+
+@app.route('/api/tts/stream', methods=['GET'])
+def api_tts_stream():
+    """Block until first audio (local or cloud) is available for the given job_id, then return audio bytes.
+
+    Query: ?job_id=...&timeout=30
+    """
+    job_id = request.args.get('job_id')
+    if not job_id:
+        return jsonify({'ok': False, 'error': 'job_id required'}), 400
+    timeout = float(request.args.get('timeout') or 30.0)
+    start = time.time()
+
+    # Poll until one of local/cloud is available or timeout
+    while True:
+        with _TTS_JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job:
+                return jsonify({'ok': False, 'error': 'unknown job_id'}), 404
+            local_b = job.get('local')
+            cloud_b = job.get('cloud')
+
+        # prefer whichever arrived first in time (we don't record arrival time, so return first non-None)
+        if local_b:
+            resp = Response(local_b, mimetype='audio/mpeg')
+            resp.headers['X-TTS-Job'] = job_id
+            resp.headers['X-TTS-Source'] = 'local'
+            return resp
+        if cloud_b:
+            resp = Response(cloud_b, mimetype='audio/mpeg')
+            resp.headers['X-TTS-Job'] = job_id
+            resp.headers['X-TTS-Source'] = 'cloud'
+            return resp
+
+        if (time.time() - start) >= timeout:
+            return jsonify({'ok': False, 'error': 'timeout waiting for audio'}), 504
+        time.sleep(0.2)
+
+
+@app.route('/api/tts/file/<job_id>', methods=['GET'])
+def api_tts_file(job_id: str):
+    """Serve saved audio file for job_id and source (local/cloud)."""
+    source = (request.args.get('source') or 'local').lower()
+    if source not in {'local', 'cloud'}:
+        return jsonify({'ok': False, 'error': 'source must be local or cloud'}), 400
+
+    with _TTS_JOB_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify({'ok': False, 'error': 'unknown job_id'}), 404
+        path = job.get(f"{source}_path")
+        data = job.get(source)
+
+    # If persisted file exists on disk, prefer it
+    try:
+        if path and os.path.exists(path):
+            with open(path, 'rb') as f:
+                b = f.read()
+            return Response(b, mimetype='audio/mpeg')
+    except Exception:
+        pass
+
+    if data:
+        return Response(data, mimetype='audio/mpeg')
+
+    return jsonify({'ok': False, 'error': 'audio not available yet'}), 404
+
+
+@app.route('/api/tts/status', methods=['GET'])
+def api_tts_status():
+    """Return job metadata and timings for a given job_id (no raw audio bytes)."""
+    job_id = request.args.get('job_id')
+    if not job_id:
+        return jsonify({'ok': False, 'error': 'job_id required'}), 400
+    with _TTS_JOB_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify({'ok': False, 'error': 'unknown job_id'}), 404
+        # Build sanitized view without raw bytes
+        out = {}
+        out['job_id'] = job_id
+        out['text'] = job.get('text')
+        out['created_at'] = job.get('created_at')
+        out['status'] = job.get('status', {})
+        out['timings'] = job.get('timings', {})
+        out['local_path'] = job.get('local_path')
+        out['cloud_path'] = job.get('cloud_path')
+    return jsonify({'ok': True, 'job': out})
+
+
+@app.route('/api/tts/summarize', methods=['POST'])
+def api_tts_summarize():
+    """Return a short, spoken-English summary for TTS.
+
+    Accepts JSON: {"text": "assistant content...", "applied": <applied object>, "prefer": "cloud"|"local"}
+    Tries preferred LLM (cloud if OPENAI_KEY, else local), falls back if unavailable.
+    """
+    data = request.get_json(force=True) or {}
+    text = data.get('text', '')
+    applied = data.get('applied')
+    prefer = (data.get('prefer') or '').lower()
+
+    # Defensive sanitization
+    def _sanitize(s: str) -> str:
+        if not s:
+            return ''
+        try:
+            out = str(s)
+            # remove common tokens that leak tooling/debug info
+            out = out.replace('tool:null', '').replace('tool: null', '')
+            out = out.replace('reply -', '').replace('reply:', '')
+            # strip JSON-ish lines that are clearly tool output labels
+            out = '\n'.join([ln for ln in out.split('\n') if not ln.strip().lower().startswith('tool:')])
+            # collapse whitespace
+            out = ' '.join(out.split())
+            return out.strip()
+        except Exception:
+            return ''
+
+    safe_text = _sanitize(text)
+    safe_applied = applied
+    try:
+        # ensure applied can be stringified
+        applied_str = json.dumps(safe_applied, default=str)
+    except Exception:
+        applied_str = str(safe_applied or '')
+
+    # Build system and user messages for the summarizer
+    system_msg = (
+        "You are a concise assistant that rewrites an assistant's output into a single natural, spoken-English sentence suitable for playback by a TTS system. "
+        "Do NOT include any JSON, code, or debug tokens such as 'tool:null', 'tool:', 'reply', or internal markers. "
+        "Do not mention internal implementation details. Keep the summary friendly, human, and under 20 words. Respond with plain text only."
+    )
+
+    user_prompt = data.get('user_prompt') or ''
+    user_msg = f"Original user request: {user_prompt}\n\nAssistant content: {safe_text}\n\nApplied result (JSON): {applied_str}\n\nProduce a single short sentence as described above."
+
+    summary = ''
+
+    # Try cloud first if preferred or available
+    def try_cloud():
+        if not OPENAI_KEY:
+            raise RuntimeError('no OPENAI_API_KEY')
+        headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
+        payload = {"model": "gpt-5.2", "messages": [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}], "temperature": 0.2}
+        resp = requests.post(OPENAI_URL, json=payload, headers=headers, timeout=15)
+        resp.raise_for_status()
+        j = resp.json()
+        try:
+            return j.get('choices', [])[0].get('message', {}).get('content', '') or ''
+        except Exception:
+            return ''
+
+    def try_local():
+        if not local_llm:
+            raise RuntimeError('no local LLM')
+        # Pass system role + user content to local LLM if supported
+        msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+        resp = local_llm.post_chat(msgs)
+        try:
+            if hasattr(local_llm, 'get_message_content'):
+                return local_llm.get_message_content(resp) or ''
+        except Exception:
+            pass
+        # Best-effort fallback
+        try:
+            return str(resp)
+        except Exception:
+            return ''
+
+    attempts = []
+    if prefer == 'cloud':
+        attempts = [try_cloud, try_local]
+    elif prefer == 'local':
+        attempts = [try_local, try_cloud]
+    else:
+        attempts = [try_cloud, try_local] if OPENAI_KEY else [try_local, try_cloud]
+
+    last_exc = None
+    for fn in attempts:
+        try:
+            out = fn()
+            out = _sanitize(out)
+            if out:
+                summary = out
+                break
+        except Exception as e:
+            last_exc = e
+            continue
+
+    if not summary:
+        summary = 'Okay — I performed the requested action.'
+
+    return jsonify({'ok': True, 'summary': summary})
+
 
 
 def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) -> dict:
