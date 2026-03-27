@@ -1,6 +1,9 @@
 # --- Backend secrets & logs ---
 .env
 
+# --- local audio ---
+backend/tts_output/
+
 # --- Python cache / bytecode (all locations, incl backend) ---
 **/__pycache__/
 **/*.py[cod]

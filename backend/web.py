@@ -119,7 +119,7 @@ try:
 except Exception:
     pass
 
-VALID_LIGHT_ACTIONS  = {"turn_on", "turn_off", "toggle"}
+VALID_LIGHT_ACTIONS  = {"turn_on", "turn_off"}
 VALID_THERMO_ACTIONS = {"increase", "decrease", "set_value", "turn_on", "turn_off"}
 
 DOWNSTAIRS = {"living room", "dining room", "kitchen"}
@@ -1269,6 +1269,15 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
     if not isinstance(js, dict):
         return {"ok": False, "error": "invalid payload"}
 
+    # Debug: log incoming toolcall for tracing
+    try:
+        print(f"[apply_toolcall] target={target} js={json.dumps(js, ensure_ascii=False)}")
+    except Exception:
+        try:
+            print(f"[apply_toolcall] target={target} js={str(js)}")
+        except Exception:
+            pass
+
     tool = js.get("tool")
     if tool not in {"manage_device", "query_state"}:
         return {"ok": False, "error": "unsupported tool"}
@@ -1429,6 +1438,22 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
         rooms_store[r][device] = new_state
         applied.append({"room": r, "new_state": new_state})
 
+    # Debug: log what was applied
+    try:
+        if applied:
+            print(f"[apply_toolcall] applied={json.dumps(applied, ensure_ascii=False)} target={target}")
+        if skipped:
+            print(f"[apply_toolcall] skipped={json.dumps(skipped, ensure_ascii=False)} target={target}")
+    except Exception:
+        pass
+
+    # If we applied any changes, publish state so SSE clients update immediately
+    if applied:
+        try:
+            publish_state_event()
+        except Exception:
+            pass
+
     # If multiple targets were specified, return bulk result
     if len(applied) > 1 or (len(skipped) > 0 and len(applied) > 0):
         return {"ok": True, "bulk": True, "scope": rooms_field or room, "device": device, "action": action, "applied": applied, "skipped": skipped}
@@ -1513,6 +1538,11 @@ def api_chat_local():
         if parsed:
             last_text = history[-1]['content'] if history else (user or '')
             applied = apply_toolcall(parsed, target='local', last_user_text=last_text)
+            try:
+                if applied:
+                    publish_state_event()
+            except Exception:
+                pass
         ms = int((t1 - t0) * 1000)
         return jsonify({'ok': True, 'resp': resp, 'content': content, 'parsed': parsed, 'applied': applied, 'ms': ms})
     except Exception as e:
@@ -1551,6 +1581,11 @@ def api_chat_cloud():
         if parsed:
             last_text = history[-1]['content'] if history else (user or '')
             applied = apply_toolcall(parsed, target='cloud', last_user_text=last_text)
+            try:
+                if applied:
+                    publish_state_event()
+            except Exception:
+                pass
         ms = int((t1 - t0) * 1000)
         return jsonify({'ok': True, 'resp': resp, 'content': content, 'parsed': parsed, 'applied': applied, 'ms': ms})
     except Exception as e:
@@ -1599,18 +1634,103 @@ def api_chat_stream():
                 parsed = None
                 applied = None
                 try:
-                    parsed = llm_helper.extract_json(content) if llm_helper else None
+                    # Prefer parsing with the local LLM helper when this event is for 'local'
+                    if who == 'local' and local_llm and hasattr(local_llm, 'extract_json'):
+                        parsed = local_llm.extract_json(content)
+                    elif llm_helper and hasattr(llm_helper, 'extract_json'):
+                        parsed = llm_helper.extract_json(content)
+                    else:
+                        parsed = None
                 except Exception:
                     parsed = None
 
+                # If model returned JSON, apply toolcall as before
                 if parsed:
                     last_text = history[-1]['content'] if history else (user or '')
                     applied = apply_toolcall(parsed, target=who, last_user_text=last_text)
+                    # ensure state SSE is pushed immediately so clients refresh
+                    try:
+                        if applied:
+                            publish_state_event()
+                    except Exception:
+                        pass
+                else:
+                    # Fallback: some assistants reply in plain language (e.g. asking
+                    # for confirmation) instead of emitting the expected JSON tool call.
+                    # Attempt a lightweight heuristic: if the user's last_text clearly
+                    # expresses a lighting intent ("dim", "dark") and mentions a known
+                    # room, synthesize a manage_device call so the UI can act.
+                    try:
+                        last_text = history[-1]['content'] if history else (user or '')
+                        lt = (last_text or '').lower()
+                        room_guess = None
+                        # look for explicit room names in the user's text
+                        for r in STATE.keys():
+                            if r and r in lt:
+                                room_guess = r
+                                break
+                        # fallback: check synonyms keys if available on either helper
+                        if not room_guess:
+                            helper_src = llm_helper or local_llm
+                            if helper_src and hasattr(helper_src, 'ROOM_SYNONYMS'):
+                                for key, mapped in getattr(helper_src, 'ROOM_SYNONYMS').items():
+                                    if key and key in lt:
+                                        room_guess = mapped
+                                        break
+
+                        action_guess = None
+                        helper_src = llm_helper or local_llm
+                        if helper_src:
+                            dim_words = getattr(helper_src, 'DIM_WORDS', set())
+                            bright_words = getattr(helper_src, 'BRIGHT_WORDS', set())
+                            if any(w in lt for w in dim_words):
+                                action_guess = 'turn_on'
+                            if any(w in lt for w in bright_words):
+                                action_guess = 'turn_off'
+
+                        # If we found a reasonable room + action, synthesize parsed JSON
+                        if room_guess and action_guess:
+                            synthesized = {'tool': 'manage_device', 'room': room_guess, 'device': 'light', 'action': action_guess}
+                            applied = apply_toolcall(synthesized, target=who, last_user_text=last_text)
+                            # Replace content with a concise confirmation so the frontend
+                            # doesn't display the assistant's follow-up question.
+                            content = f"Action applied: {action_guess} {room_guess}"
+                    except Exception:
+                        pass
 
                 payload = {"model": who, "ok": True, "content": content, "parsed": parsed, "applied": applied, "ms": t}
                 yield f"event: model\ndata: {json.dumps(payload, default=str)}\n\n"
 
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
+
+
+@app.post('/api/debug/apply')
+def api_debug_apply():
+    """Temporary debug endpoint: apply a device action directly and publish state.
+
+    Accepts JSON: { room, device, action, target }
+    - room: room name or scope (all/upstairs/downstairs)
+    - device: 'light' or 'thermostat'
+    - action: action string (turn_on/turn_off/etc)
+    - target: optional 'local'|'cloud'|'host' (default 'local')
+    """
+    data = request.get_json(force=True) or {}
+    room = data.get('room', '')
+    device = data.get('device', '')
+    action = data.get('action', '')
+    target = (data.get('target') or 'local').strip().lower()
+    if target not in {'local', 'cloud', 'host', 'host'}:
+        target = 'local'
+
+    try:
+        res = apply_toolcall({'tool': 'manage_device', 'room': room, 'device': device, 'action': action}, target= 'local' if target == 'local' else ('cloud' if target == 'cloud' else 'host'))
+        try:
+            publish_state_event()
+        except Exception:
+            pass
+        return jsonify({'ok': True, 'result': res})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 
 @app.get('/api/state/stream')

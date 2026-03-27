@@ -124,15 +124,17 @@ function roomBox(roomName, devices){
       <div class="controls">
         <button class="btn" data-device="light"  data-action="turn_on">On</button>
         <button class="btn" data-device="light"  data-action="turn_off">Off</button>
-        <button class="btn" data-device="light"  data-action="toggle">Toggle</button>
       </div>
     </div>
   `;
 
-  // Click room to toggle light
+  // Click room to toggle light state (send explicit on/off)
   el.addEventListener("click", (e) => {
     if (e.target.closest(".btn")) return;
-    sendAction(roomName, "light", "toggle");
+    // determine current state from badge/status text
+    const current = (el.querySelector('.status-text') || {}).textContent || '';
+    const isCurrentlyOn = String(current || '').toLowerCase().includes('on');
+    sendAction(roomName, "light", isCurrentlyOn ? "turn_off" : "turn_on");
   });
 
   // Button handlers
@@ -632,7 +634,7 @@ function composeSummary(parsed, applied, content){
     if (applied && typeof applied === 'object'){
       // Human-friendly verbs
       const verbMap = {
-        'turn_on': 'turned on', 'turn_off': 'turned off', 'toggle': 'toggled',
+        'turn_on': 'turned on', 'turn_off': 'turned off',
         'increase': 'increased', 'decrease': 'decreased', 'set_value': 'set'
       };
 

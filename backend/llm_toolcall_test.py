@@ -35,12 +35,12 @@ SYSTEM_PROMPT = """
 You are Butler. Only use JSON tool outputs for the following two supported tools: `manage_device` and `query_state`.
 
 When controlling devices, produce JSON exactly in this shape:
-{"tool":"manage_device","room":"<living room|dining room|kitchen|bathroom|bedroom|office|all|upstairs|downstairs>","device":"<light|thermostat>","action":"<turn_on|turn_off|toggle|increase|decrease|set_value>","value":"<number optional>"}
+{"tool":"manage_device","room":"<living room|dining room|kitchen|bathroom|bedroom|office|all|upstairs|downstairs>","device":"<light|thermostat>","action":"<turn_on|turn_off|increase|decrease|set_value>","value":"<number optional>"}
 
 If the user refers to multiple rooms, emit a `rooms` array instead of a single `room` string. Example:
 {"tool":"manage_device","rooms":["dining room","kitchen"],"device":"light","action":"turn_on"}
 
-IMPORTANT: For device `light`, only use actions `turn_on`, `turn_off`, or `toggle`. Do NOT use `increase` or `decrease` for lights — those are for the thermostat only.
+IMPORTANT: For device `light`, only use actions `turn_on` or `turn_off`. Do NOT use `increase` or `decrease` for lights — those are for the thermostat only.
 
 When querying state, produce JSON exactly in this shape:
 {"tool":"query_state","room":"<house|living room|dining room|kitchen|bathroom|bedroom|office|all|upstairs|downstairs>","device":"<light|thermostat|all optional>"}
@@ -64,7 +64,7 @@ Respond with a plain natural-language story. Do NOT include the words "Plain tex
 # VALID_ROOMS and VALID_DEVICES are imported from helpers
 
 VALID_ACTIONS = {
-    "light": {"turn_on", "turn_off", "toggle"},
+    "light": {"turn_on", "turn_off"},
     # blinds removed from setup — only thermostat and light supported
     "thermostat": {"increase", "decrease", "set_value", "turn_on", "turn_off"},
 }
@@ -195,9 +195,12 @@ def validate(js: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
             parts = [room] if room else []
 
         if isinstance(rooms_list, list):
-            list_to_check = [str(r).strip().lower() for r in rooms_list]
+            raw_list = [str(r).strip() for r in rooms_list]
         else:
-            list_to_check = parts
+            raw_list = parts
+
+        # Normalize room names with `norm_room` so phrases like "the office" -> "office"
+        list_to_check = [norm_room(r) for r in raw_list if r]
         device = (js.get("device", "") or "").strip().lower()
         action = (js.get("action", "") or "").strip().lower()
 
@@ -221,11 +224,12 @@ def validate(js: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         return True, None
 
     if tool == "query_state":
-        room = (js.get("room", "") or "").strip().lower()
+        room_raw = (js.get("room", "") or "").strip()
+        room = norm_room(room_raw)
         device = (js.get("device", "all") or "all").strip().lower()
 
         if room not in VALID_ROOMS:
-            return False, f"invalid room for query: {room}"
+            return False, f"invalid room for query: {room_raw}"
 
         if device != "all" and device not in VALID_DEVICES:
             return False, f"invalid device for query: {device}"
