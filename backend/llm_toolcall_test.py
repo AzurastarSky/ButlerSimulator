@@ -37,27 +37,33 @@ DEVICE_SYNONYMS: Dict[str, str] = {
 }
 
 SYSTEM_PROMPT = """
-You are Butler. Output JSON only.
-When controlling devices, reply:
+You are Butler. Only use JSON tool outputs for the following two supported tools: `manage_device` and `query_state`.
+
+When controlling devices, produce JSON exactly in this shape:
 {"tool":"manage_device","room":"<living room|dining room|kitchen|bathroom|bedroom|office|all|upstairs|downstairs>","device":"<light|thermostat>","action":"<turn_on|turn_off|toggle|increase|decrease|set_value>","value":"<number optional>"}
-If the user refers to multiple rooms, prefer emitting a `rooms` array instead of a single `room` string. Example for multiple rooms:
+
+If the user refers to multiple rooms, emit a `rooms` array instead of a single `room` string. Example:
 {"tool":"manage_device","rooms":["dining room","kitchen"],"device":"light","action":"turn_on"}
 
-IMPORTANT: For device `light`, only use actions `turn_on`, `turn_off`, or `toggle`.
-Do NOT use `increase` or `decrease` for lights — those are for the thermostat only. If the user says "a bit dim" or similar, emit `turn_on` for the relevant room(s).
-When querying state, reply:
+IMPORTANT: For device `light`, only use actions `turn_on`, `turn_off`, or `toggle`. Do NOT use `increase` or `decrease` for lights — those are for the thermostat only.
+
+When querying state, produce JSON exactly in this shape:
 {"tool":"query_state","room":"<house|living room|dining room|kitchen|bathroom|bedroom|office|all|upstairs|downstairs>","device":"<light|thermostat|all optional>"}
-If no device intent, reply:
-{"tool":null,"reply":"a short friendly message"}
+
+If the user's request is NOT about device control or state (for example: storytelling, general chat, summaries, creative writing, or other conversational replies), DO NOT emit JSON or tool invocations. Instead, respond in plain natural language (no JSON) with a helpful assistant reply.
+
+If there is ambiguity about whether the user intends a device action, prefer a short clarifying natural-language question rather than emitting a tool call.
+
 Temperature intent rules:
 - cold/chilly/freezing -> thermostat increase; hot/warm/boiling/roasting -> decrease
 - numeric phrasing ('increase/decrease by X' or 'set to X') must include value=X
 - intensity (no number): a bit/slightly=1; quite/pretty/fairly/somewhat=2; very/really/too=3; extremely/way too=4
+
 Examples:
 User: I am a little cold
 {"tool":"manage_device","room":"all","device":"thermostat","action":"increase"}
-User: what is the thermostat set to?
-{"tool":"query_state","room":"house","device":"thermostat"}
+User: tell me a 100 word story
+Respond with a plain natural-language story. Do NOT include the words "Plain text", "not JSON", or any formatting hints in your reply. Never echo prompt examples or formatting instructions verbatim.
 """
 
 VALID_ROOMS = {
@@ -464,11 +470,10 @@ def friendly_control_reply(result: Dict[str, Any]) -> str:
     if result.get("device") == "thermostat":
         house = result.get("house", {})
         target = house.get("target")
-        current = house.get("current")
         mode = str(house.get("mode", "")).upper()
 
         try:
-            return f"Okay, thermostat set to {mode} • Target {float(target):.0f}°C • Current {float(current):.1f}°C."
+            return f"Okay, thermostat set to {mode} • Target {float(target):.0f}°C."
         except Exception:
             return "Okay, thermostat updated."
 
@@ -494,7 +499,7 @@ def friendly_query_reply(result: Dict[str, Any]) -> str:
         house = result.get("house", {})
         return (
             f"Thermostat: mode {str(house.get('mode', '-')).upper()}, "
-            f"target {house.get('target', '-')}°C, current {house.get('current', '-')}°C."
+            f"target {house.get('target', '-')}°C."
         )
 
     device = result.get("device", "all")

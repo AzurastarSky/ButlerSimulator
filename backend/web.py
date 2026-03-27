@@ -1,5 +1,7 @@
 # backend/web.py
 from flask import Flask, send_from_directory, request, jsonify, Response, stream_with_context
+import base64
+import re
 from pathlib import Path
 import time
 import os
@@ -10,6 +12,14 @@ import copy
 import queue
 import threading
 import uuid
+
+def sse_format(event: str, data: dict) -> str:
+    """Format a Server-Sent Event (SSE) message with JSON data."""
+    try:
+        payload = json.dumps(data)
+    except Exception:
+        payload = json.dumps({'error': 'failed to serialize event data'})
+    return f"event: {event}\ndata: {payload}\n\n"
 
 app = Flask(__name__, static_folder="../frontend", static_url_path="")
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
@@ -30,7 +40,6 @@ STATE = {
 # House thermostat (single, house-level)
 HOUSE = {
     "target": 20.0,   # °C
-    "current": 19.0,  # °C
     "mode": "heat",   # "heat" | "off"
 }
 # Duplicate per-model state (local vs cloud) so we can simulate two independent houses
@@ -39,8 +48,8 @@ STATE_CLOUD = copy.deepcopy(STATE)
 HOUSE_LOCAL = copy.deepcopy(HOUSE)
 HOUSE_CLOUD = copy.deepcopy(HOUSE)
 AMBIENT = 18.0               # °C when heating is off, drift target
-HEAT_RATE_C_PER_SEC = 0.02   # how fast current approaches target when heating
-COOL_RATE_C_PER_SEC = 0.01   # how fast current moves toward ambient when off
+HEAT_RATE_C_PER_SEC = 0.02   # how fast temperature approaches target when heating
+COOL_RATE_C_PER_SEC = 0.01   # how fast temperature moves toward ambient when off
 LAST_UPDATE = time.time()
 LAST_UPDATE_LOCAL = time.time()
 LAST_UPDATE_CLOUD = time.time()
@@ -207,10 +216,92 @@ def _save_job_audio(job_id: str, source: str, data: bytes) -> str:
         pass
     return str(outp)
 
+def _save_chunk_audio(job_id: str, chunk_idx: int, source: str, data: bytes) -> str:
+    _ensure_tts_output_dir()
+    fname = f"{job_id}_chunk{chunk_idx}_{source}.mp3"
+    outp = TTS_OUTPUT_DIR / fname
+    try:
+        with open(outp, 'wb') as f:
+            f.write(data)
+    except Exception:
+        pass
+    return str(outp)
+
+def _split_into_chunks(text: str, min_tokens: int = 5, max_chunks: int = 3):
+    """Split text on sentence-ending punctuation but avoid creating too many chunks.
+
+    Rules applied:
+    - If text is short (<=32 tokens) return a single chunk.
+    - If punctuation is sparse (<=1 sentence ender), return a single chunk.
+    - Otherwise split on sentence-ending punctuation, merge very small pieces to meet min_tokens,
+      and cap the number of chunks to `max_chunks` by merging tail chunks.
+    """
+    if not text:
+        return []
+    import re
+    toks = text.strip().split()
+    total_tokens = len(toks)
+    # Short input -> single chunk (fast path)
+    if total_tokens <= 120:
+        return [text.strip()]
+
+    # If very few punctuation markers, keep single chunk to avoid overhead
+    sent_enders = re.findall(r'[\.\!\?;:]', text)
+    if len(sent_enders) <= 1:
+        return [text.strip()]
+
+    # Split on sentence-ending punctuation
+    parts = re.split(r'(?<=[\.\!\?;:])\s+', text.strip())
+    # Merge small pieces to ensure min_tokens
+    merged = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if len(p.split()) >= min_tokens:
+            merged.append(p)
+        else:
+            if merged:
+                merged[-1] = (merged[-1] + ' ' + p).strip()
+            else:
+                merged.append(p)
+
+    # Ensure all chunks meet min_tokens by merging forward
+    i = 0
+    while i < len(merged):
+        if len(merged[i].split()) < min_tokens and i+1 < len(merged):
+            merged[i] = (merged[i] + ' ' + merged[i+1]).strip()
+            merged.pop(i+1)
+            continue
+        i += 1
+
+    # Cap the number of chunks to max_chunks by merging from the end
+    while len(merged) > max_chunks:
+        # merge last into second-last
+        merged[-2] = (merged[-2] + ' ' + merged[-1]).strip()
+        merged.pop()
+
+    return merged
+
+
+_SENT_RE = re.compile(r'([\.\!\?;:]+)(\s+|$)')
+def _extract_sentences(buf: str):
+    """Extract complete sentences from text using sentence-ending punctuation.
+    Returns (sentences, remainder)
+    """
+    sentences = []
+    start = 0
+    for m in _SENT_RE.finditer(buf):
+        end = m.end()
+        s = buf[start:end].strip()
+        if s:
+            sentences.append(s)
+        start = end
+    return sentences, buf[start:]
+
 def _start_tts_background(job_id: str, text: str, voice: str = None):
     """Run local and cloud TTS in background and populate JOBS entry."""
     def work():
-        # synthesize local/cloud and record timings
         def run_provider(src, provider):
             t0 = time.time()
             data = None
@@ -240,15 +331,12 @@ def _start_tts_background(job_id: str, text: str, voice: str = None):
                     job['status'][src] = 'failed'
                 JOBS[job_id] = job
 
-        # Run both in parallel and fill JOBS when ready
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
             futures = {}
             if local_tts_provider:
                 futures[ex.submit(run_provider, 'local', local_tts_provider)] = 'local'
             if cloud_tts_provider:
                 futures[ex.submit(run_provider, 'cloud', cloud_tts_provider)] = 'cloud'
-
-            # wait for completions so timings are recorded; results handled in run_provider
             for fut in concurrent.futures.as_completed(futures):
                 _ = futures.get(fut)
 
@@ -267,92 +355,22 @@ def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 def _update_house_temp():
+    # No longer tracking a simulated 'current' temperature.
+    # Keep the timestamp so periodic publisher remains functional.
     global LAST_UPDATE
-    now = time.time()
-    dt = now - LAST_UPDATE
-    if dt <= 0:
-        return
-    cur = HOUSE["current"]
-    tgt = HOUSE["target"]
-    mode = HOUSE["mode"]
-
-    if mode == "heat":
-        # Approach target
-        if abs(cur - tgt) > 1e-3:
-            step = HEAT_RATE_C_PER_SEC * dt
-            if cur < tgt:
-                cur = min(tgt, cur + step)
-            else:
-                cur = max(tgt, cur - step)
-    else:
-        # Drift toward ambient when off
-        if abs(cur - AMBIENT) > 1e-3:
-            step = COOL_RATE_C_PER_SEC * dt
-            if cur < AMBIENT:
-                cur = min(AMBIENT, cur + step)
-            else:
-                cur = max(AMBIENT, cur - step)
-
-    HOUSE["current"] = round(cur, 2)
-    LAST_UPDATE = now
+    LAST_UPDATE = time.time()
 
 
 def _update_house_temp_local():
+    # No longer tracking a simulated 'current' temperature for local store.
     global LAST_UPDATE_LOCAL
-    now = time.time()
-    dt = now - LAST_UPDATE_LOCAL
-    if dt <= 0:
-        return
-    cur = HOUSE_LOCAL.get("current", 0.0)
-    tgt = HOUSE_LOCAL.get("target", 20.0)
-    mode = HOUSE_LOCAL.get("mode", "off")
-
-    if mode == "heat":
-        if abs(cur - tgt) > 1e-3:
-            step = HEAT_RATE_C_PER_SEC * dt
-            if cur < tgt:
-                cur = min(tgt, cur + step)
-            else:
-                cur = max(tgt, cur - step)
-    else:
-        if abs(cur - AMBIENT) > 1e-3:
-            step = COOL_RATE_C_PER_SEC * dt
-            if cur < AMBIENT:
-                cur = min(AMBIENT, cur + step)
-            else:
-                cur = max(AMBIENT, cur - step)
-
-    HOUSE_LOCAL["current"] = round(cur, 2)
-    LAST_UPDATE_LOCAL = now
+    LAST_UPDATE_LOCAL = time.time()
 
 
 def _update_house_temp_cloud():
+    # No longer tracking a simulated 'current' temperature for cloud store.
     global LAST_UPDATE_CLOUD
-    now = time.time()
-    dt = now - LAST_UPDATE_CLOUD
-    if dt <= 0:
-        return
-    cur = HOUSE_CLOUD.get("current", 0.0)
-    tgt = HOUSE_CLOUD.get("target", 20.0)
-    mode = HOUSE_CLOUD.get("mode", "off")
-
-    if mode == "heat":
-        if abs(cur - tgt) > 1e-3:
-            step = HEAT_RATE_C_PER_SEC * dt
-            if cur < tgt:
-                cur = min(tgt, cur + step)
-            else:
-                cur = max(tgt, cur - step)
-    else:
-        if abs(cur - AMBIENT) > 1e-3:
-            step = COOL_RATE_C_PER_SEC * dt
-            if cur < AMBIENT:
-                cur = min(AMBIENT, cur + step)
-            else:
-                cur = max(AMBIENT, cur - step)
-
-    HOUSE_CLOUD["current"] = round(cur, 2)
-    LAST_UPDATE_CLOUD = now
+    LAST_UPDATE_CLOUD = time.time()
 
 # ---------------- Static routes ----------------
 @app.get("/")
@@ -766,10 +784,18 @@ def api_tts_start():
         return jsonify({'ok': False, 'error': 'no text provided'}), 400
     voice = data.get('voice')
     job_id = uuid.uuid4().hex
+    # create a single job and start background synth for full text
     with _TTS_JOB_LOCK:
-        JOBS[job_id] = {'text': text, 'created_at': time.time(), 'status': {}}
+        JOBS[job_id] = {
+            'text': text,
+            'created_at': time.time(),
+            'status': {
+                'local': 'pending' if local_tts_provider else 'disabled',
+                'cloud': 'pending' if cloud_tts_provider else 'disabled'
+            },
+            'timings': {}
+        }
 
-    # start background synth
     try:
         _start_tts_background(job_id, text, voice=voice)
     except Exception as e:
@@ -858,16 +884,220 @@ def api_tts_status():
         job = JOBS.get(job_id)
         if not job:
             return jsonify({'ok': False, 'error': 'unknown job_id'}), 404
-        # Build sanitized view without raw bytes
-        out = {}
-        out['job_id'] = job_id
-        out['text'] = job.get('text')
-        out['created_at'] = job.get('created_at')
-        out['status'] = job.get('status', {})
-        out['timings'] = job.get('timings', {})
-        out['local_path'] = job.get('local_path')
-        out['cloud_path'] = job.get('cloud_path')
+        out = {
+            'job_id': job_id,
+            'text': job.get('text'),
+            'created_at': job.get('created_at'),
+            'status': job.get('status', {}),
+            'timings': job.get('timings', {}),
+            'local_path': job.get('local_path'),
+            'cloud_path': job.get('cloud_path')
+        }
     return jsonify({'ok': True, 'job': out})
+
+
+@app.route('/api/tts/jobs', methods=['GET'])
+def api_tts_jobs():
+    """Debug endpoint: list current JOBS keys and sizes for inspection."""
+    out = {}
+    with _TTS_JOB_LOCK:
+        for k, v in JOBS.items():
+            try:
+                local_bytes = len(v.get('local', b'')) if isinstance(v.get('local', b''), (bytes, bytearray)) else None
+            except Exception:
+                local_bytes = None
+            try:
+                cloud_bytes = len(v.get('cloud', b'')) if isinstance(v.get('cloud', b''), (bytes, bytearray)) else None
+            except Exception:
+                cloud_bytes = None
+            out[k] = {
+                'status': v.get('status'),
+                'local_bytes': local_bytes,
+                'cloud_bytes': cloud_bytes,
+                'local_path': v.get('local_path'),
+                'cloud_path': v.get('cloud_path'),
+                'chunks': v.get('chunks')
+            }
+    return jsonify({'ok': True, 'jobs': out})
+
+
+@app.route('/api/tts/stream_sentences', methods=['POST'])
+def api_tts_stream_sentences():
+    """Stream TTS per-sentence for non-tool responses.
+
+    Request JSON:
+      - text: string
+      - source: 'local'|'cloud'|'race' (default: 'local')
+      - voice: voice name
+
+    Emits SSE events:
+      - sentence: {index, audio_data (base64), mime_type, text, tts_ms}
+      - final_audio: {url}
+      - tts_metrics: {ttfa_ms, tts_total_ms, sentences}
+      - app_error/done
+    """
+    try:
+        body = request.get_json(force=True) or {}
+    except Exception:
+        body = {}
+
+    text = (body.get('text') or '').strip()
+    source = (body.get('source') or 'local').lower()
+    voice = body.get('voice') or 'alloy'
+
+    if not text:
+        def bad():
+            yield sse_format('app_error', {'message': 'Text is empty'})
+            yield sse_format('done', {})
+        return Response(stream_with_context(bad()), mimetype='text/event-stream')
+
+    headers = {
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+    }
+
+    def gen():
+        run_id = uuid.uuid4().hex
+        parts = []
+        ttfa_ms = None
+        t_start = time.perf_counter()
+
+        # Extract sentences by punctuation
+        sentences, remainder = _extract_sentences(text)
+        if remainder.strip():
+            sentences.append(remainder.strip())
+
+        if not sentences:
+            yield sse_format('app_error', {'message': 'No sentences to synthesize'})
+            yield sse_format('done', {})
+            return
+
+        for idx, sentence in enumerate(sentences):
+            if not sentence.strip():
+                continue
+            a0 = time.perf_counter()
+            audio_bytes = None
+
+            # Choose provider
+            try:
+                if source == 'local':
+                    if not local_tts_provider:
+                        raise RuntimeError('local TTS provider not configured')
+                    audio_bytes = local_tts_provider.synthesize_speech(sentence, voice)
+                elif source == 'cloud':
+                    if not cloud_tts_provider:
+                        raise RuntimeError('cloud TTS provider not configured')
+                    audio_bytes = cloud_tts_provider.synthesize_speech(sentence, voice)
+                else:
+                    # race: choose whichever returns first (local vs cloud)
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                    def call_local():
+                        if not local_tts_provider:
+                            raise RuntimeError('local TTS provider not configured')
+                        return local_tts_provider.synthesize_speech(sentence, voice)
+
+                    def call_cloud():
+                        if not cloud_tts_provider:
+                            raise RuntimeError('cloud TTS provider not configured')
+                        return cloud_tts_provider.synthesize_speech(sentence, voice)
+
+                    with ThreadPoolExecutor(max_workers=2) as ex:
+                        futures = {ex.submit(call_local): 'local', ex.submit(call_cloud): 'cloud'}
+                        for f in as_completed(futures):
+                            try:
+                                audio_bytes = f.result()
+                                break
+                            except Exception:
+                                continue
+
+                a1 = time.perf_counter()
+            except Exception as e:
+                yield sse_format('app_error', {'message': f'TTS failed for sentence {idx}: {repr(e)}'})
+                continue
+
+            if not audio_bytes:
+                yield sse_format('app_error', {'message': f'TTS returned empty audio for sentence {idx}'})
+                continue
+
+            parts.append(bytes(audio_bytes))
+            # persist each chunk to disk so we can reliably reconstruct the full
+            # audio later and provide per-chunk artifacts for debugging/inspection
+            try:
+                chunk_path = _save_chunk_audio(run_id, idx, source, audio_bytes)
+                with _TTS_JOB_LOCK:
+                    job = JOBS.get(run_id) or {}
+                    job.setdefault('chunks', []).append(chunk_path)
+                    JOBS[run_id] = job
+            except Exception:
+                # non-fatal; continue streaming (chunk save failed)
+                try:
+                    print(f"[TTS STREAM] run_id={run_id} source={source} sentence_idx={idx} chunk_save_failed")
+                except Exception:
+                    pass
+
+            if ttfa_ms is None:
+                ttfa_ms = int((a1 - t_start) * 1000.0)
+
+            audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+
+            yield sse_format('sentence', {
+                'index': idx,
+                'audio_data': audio_b64,
+                'mime_type': 'audio/mpeg',
+                'text': sentence,
+                'tts_ms': (a1 - a0) * 1000.0
+            })
+
+        # Save full audio
+        full = b''.join(parts)
+        try:
+            job_meta = {'text': text, 'created_at': time.time()}
+            with _TTS_JOB_LOCK:
+                JOBS[run_id] = job_meta
+
+            save_path = _save_job_audio(run_id, source, full)
+            with _TTS_JOB_LOCK:
+                # Save under both the legacy key (source) and a bytes-specific key so
+                # `api_tts_file` and other consumers can find the final audio regardless
+                # of which key they check.
+                JOBS[run_id][f"{source}_path"] = save_path
+                JOBS[run_id][f"{source}_bytes"] = full
+                JOBS[run_id][source] = full
+                JOBS[run_id]['status'] = {source: 'done'}
+        except Exception:
+            yield sse_format('app_error', {'message': 'Failed to persist final audio'})
+
+        t_end = time.perf_counter()
+        tts_total_ms = int((t_end - t_start) * 1000.0)
+
+        # final audio URL (use existing file-serving endpoint)
+        yield sse_format('final_audio', {'url': f'/api/tts/file/{run_id}?source={source}'})
+
+        # Also emit the full audio bytes as base64 over SSE so clients can obtain the
+        # authoritative final audio even when the server is busy handling the streaming
+        # connection (Flask dev server may be single-threaded). This prevents a race
+        # where clients fetch the file URL before the OS has flushed the file to disk.
+        try:
+            audio_b64_full = base64.b64encode(full).decode('utf-8')
+            yield sse_format('final_audio_bytes', {
+                'audio_data': audio_b64_full,
+                'mime_type': 'audio/mpeg'
+            })
+        except Exception:
+            # non-fatal; continue
+            pass
+
+        yield sse_format('tts_metrics', {
+            'ttfa_ms': ttfa_ms,
+            'tts_total_ms': tts_total_ms,
+            'sentences': len(sentences)
+        })
+
+        yield sse_format('done', {})
+
+    return Response(stream_with_context(gen()), mimetype='text/event-stream', headers=headers)
 
 
 @app.route('/api/tts/summarize', methods=['POST'])
@@ -887,12 +1117,36 @@ def api_tts_summarize():
         if not s:
             return ''
         try:
-            out = str(s)
-            # remove common tokens that leak tooling/debug info
-            out = out.replace('tool:null', '').replace('tool: null', '')
-            out = out.replace('reply -', '').replace('reply:', '')
-            # strip JSON-ish lines that are clearly tool output labels
-            out = '\n'.join([ln for ln in out.split('\n') if not ln.strip().lower().startswith('tool:')])
+            out = str(s).strip()
+            # If the assistant returned a JSON-like wrapper, try to parse and extract useful text
+            try:
+                j = json.loads(out)
+                if isinstance(j, dict):
+                    # prefer `reply` or `content` or `text` keys if present
+                    for k in ('reply', 'content', 'text', 'message'):
+                        if k in j and j.get(k):
+                            return str(j.get(k)).strip()
+                    # If the JSON only contains a tool invocation / metadata (e.g. {"tool":"tell_story","story_length":100}),
+                    # treat it as no user-facing content so we don't send it to TTS.
+                    tool_like_keys = {'tool', 'action', 'command', 'tool_name', 'tool_call'}
+                    if any((k.lower() in tool_like_keys or k.lower().endswith('_length') or k.lower().endswith('_size')) for k in j.keys()):
+                        return ''
+                    # fallback: join any string-valued properties
+                    vals = [str(v).strip() for v in j.values() if isinstance(v, str) and v.strip()]
+                    if vals:
+                        return ' '.join(vals).strip()
+            except Exception:
+                # not JSON — continue with regex cleaning
+                pass
+
+            # remove common tokens that leak tooling/debug info (cover quoted keys too)
+            import re
+            out = re.sub(r'"?tool"?\s*:\s*null,?', '', out, flags=re.IGNORECASE)
+            out = re.sub(r'"?tool"?\s*:\s*"[^"]*"\s*,?', '', out, flags=re.IGNORECASE)
+            out = re.sub(r'reply\s*-\s*', '', out, flags=re.IGNORECASE)
+            out = re.sub(r'reply\s*:\s*', '', out, flags=re.IGNORECASE)
+            # strip lines that start with tool: or similar labels
+            out = '\n'.join([ln for ln in out.split('\n') if not re.match(r'^\s*"?tool"?\s*:', ln, flags=re.IGNORECASE)])
             # collapse whitespace
             out = ' '.join(out.split())
             return out.strip()
@@ -986,7 +1240,7 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
         return {"ok": False, "error": "invalid payload"}
 
     tool = js.get("tool")
-    if tool != "manage_device":
+    if tool not in {"manage_device", "query_state"}:
         return {"ok": False, "error": "unsupported tool"}
 
     # Support multiple-room specifications: 'rooms' list or comma/and-separated 'room' string
@@ -1006,6 +1260,49 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
     # Select target stores
     rooms_store = STATE_LOCAL if target == 'local' else STATE_CLOUD
     house_store = HOUSE_LOCAL if target == 'local' else HOUSE_CLOUD
+
+    # Handle lightweight query_state toolcalls which request room/device state
+    if tool == 'query_state':
+        # Accept either 'room' (string) or 'rooms' (list). If rooms contains 'all', return all rooms.
+        raw_room = js.get('room', '') or ''
+        rooms_field = js.get('rooms', None)
+        if isinstance(raw_room, list) and not rooms_field:
+            rooms_field = raw_room
+            room = ''
+        else:
+            room = norm_room(raw_room) if not isinstance(raw_room, list) else ''
+
+        # If device is thermostat, return house-level state
+        device = norm_device(js.get('device', ''))
+        if device == 'thermostat':
+            return {'ok': True, 'query': {'device': 'thermostat', 'target_store': target}, 'result': {'thermostat': dict(house_store)}}
+
+        # Build list of targets for room-level queries
+        if isinstance(rooms_field, list) and len(rooms_field) > 0:
+            normed = [norm_room(str(r)) for r in rooms_field]
+            if any(r == 'all' for r in normed):
+                targets = list(rooms_store.keys())
+            else:
+                targets = normed
+        else:
+            if room in { 'all', 'upstairs', 'downstairs' }:
+                targets = list(rooms_store.keys()) if room == 'all' else ([r for r in rooms_store if (r in UPSTAIRS if room == 'upstairs' else r in DOWNSTAIRS)])
+            else:
+                targets = [room]
+
+        # If device not specified, return whole-room states
+        result = {'ok': True, 'query': {'targets': targets, 'device': device, 'target_store': target}}
+        data = {}
+        for r in targets:
+            if not r or r not in rooms_store:
+                data[r] = None
+                continue
+            if device:
+                data[r] = rooms_store[r].get(device)
+            else:
+                data[r] = dict(rooms_store[r])
+        result['result'] = data
+        return result
 
     # Map blinds to light if needed (frontend no longer has blinds)
     if device == "blinds":
@@ -1052,7 +1349,7 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
         elif action == "turn_off":
             house_store["mode"] = "off"
 
-        # update current temp slightly for that target house
+        # trigger house update for that target (timestamp maintenance)
         if target == 'local':
             _update_house_temp_local()
         elif target == 'cloud':
@@ -1072,9 +1369,16 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
     if device not in {"light"}:
         return {"ok": False, "error": f"Unsupported device for target: {device}"}
 
-    # Multi-room: if 'rooms' list provided, apply to those rooms
+    # Multi-room: if 'rooms' list provided, apply to those rooms.
+    # Treat a list containing a single 'all' (or any item normalized to 'all')
+    # as the special scope 'all' rather than attempting to apply to a room
+    # literally named 'all'. This handles model outputs like {"rooms":["all"]}.
     if isinstance(rooms_field, list) and len(rooms_field) > 0:
-        targets = [norm_room(str(r)) for r in rooms_field]
+        normed = [norm_room(str(r)) for r in rooms_field]
+        if any(r == 'all' for r in normed):
+            targets = list(rooms_store.keys())
+        else:
+            targets = normed
     else:
         # If room is a comma/and-separated list, split it
         if isinstance(raw_room, str) and ("," in raw_room or " and " in raw_room):

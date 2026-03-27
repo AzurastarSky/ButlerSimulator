@@ -250,9 +250,27 @@ function ensureRespEl(who){
   return el;
 }
 
+// Persistent metrics helper: store numeric metrics in data attributes and render
+// Replace previous multi-metric UI with single TTFA metric display
+function _metricsSet(who, key, val){
+  // Only handle TTFA metric now: key === 'ttfa'
+  if (key !== 'ttfa') return;
+  const metricsId = who === 'local' ? 'metrics-local' : 'metrics-cloud';
+  const mid = document.getElementById(metricsId);
+  if (!mid) return;
+  try{
+    if (val === null || typeof val === 'undefined' || val === ''){
+      mid.textContent = '';
+    } else {
+      mid.textContent = `TTFA: ${Math.round(Number(val))}ms`;
+    }
+  }catch(e){/*ignore*/}
+}
+
 // Prompt handling + SSE
 function openRaceSSE(text){
   const url = `/api/chat/stream?user=${encodeURIComponent(text)}`;
+  const promptStart = Date.now();
   const es = new EventSource(url);
   ensureRespEl('local').textContent = 'waiting...';
   ensureRespEl('cloud').textContent = 'waiting...';
@@ -264,68 +282,38 @@ function openRaceSSE(text){
       const content = data.content || '';
       // Blurb box: only show assistant/tool content (no timings)
       ensureRespEl(who).textContent = content.replace(/\n/g,' ');
-      // Metrics block below: show LLM timing
-      try{
-        const mid = who === 'local' ? document.getElementById('metrics-local') : document.getElementById('metrics-cloud');
-        if (mid) mid.textContent = ms ? `LLM: ${ms}ms` : '';
-      }catch(e){}
+      // Metrics block below: persist LLM timing
+      try{ _metricsSet(who, 'llm', ms); }catch(e){}
       await fetchStateFor(who);
       const panel = who === 'local' ? floorLocal.parentElement : floorCloud.parentElement;
       panel.style.boxShadow = '0 0 0 3px rgba(102,178,255,0.12)';
       setTimeout(()=> panel.style.boxShadow = '', 800);
-      // Auto-synthesize and play the assistant SUMMARY (after tool call)
+      // Auto-synthesize and play: summarize only when a tool call was performed
       try{
-        // (composeSummary is defined at top-level and reused here)
-
-        // Ask backend LLM to produce a short spoken-English summary
+        const safeContent = sanitizeForTTS(content);
         let textToSpeak = null;
-        try{
-          const pref = who === 'cloud' ? 'cloud' : 'local';
-          const safeText = sanitizeForTTS(content);
-          const sumResp = await fetch('/api/tts/summarize', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: safeText, applied: data.applied, prefer: pref }) });
-          if (sumResp.ok){
-            const sj = await sumResp.json().catch(()=>null);
-            if (sj && sj.summary) textToSpeak = sj.summary;
-          }
-        }catch(e){ console.warn('summarize call failed', e); }
-
-        if (!textToSpeak){
-          // fallback to local compose
-          textToSpeak = composeSummary(data.parsed, data.applied, sanitizeForTTS(content));
+        if (data.applied && typeof data.applied === 'object' && Object.keys(data.applied).length > 0){
+          // Tool call present — ask backend summarizer to produce a short spoken summary
+          try{
+            const pref = who === 'cloud' ? 'cloud' : 'local';
+            const sumResp = await fetch('/api/tts/summarize', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: safeContent, applied: data.applied, prefer: pref }) });
+            if (sumResp.ok){ const sj = await sumResp.json().catch(()=>null); if (sj && sj.summary) textToSpeak = sj.summary; }
+          }catch(e){ console.warn('summarize call failed', e); }
+          if (!textToSpeak){ textToSpeak = composeSummary(data.parsed, data.applied, safeContent); }
+        } else {
+          // No tool call — speak the assistant content directly
+          textToSpeak = safeContent;
         }
 
         if (textToSpeak){
           const voice = who === 'cloud' ? 'sage' : undefined;
           const safeSpeak = sanitizeForTTS(textToSpeak);
-          const startResp = await startTTS(safeSpeak, voice).catch(e=>{ console.warn('TTS start failed', e); return null; });
-          if (startResp && startResp.ok){
-            const job = startResp.job_id;
-            // show timing metrics while TTS runs
-            monitorTTSStatus(job, who).catch(()=>{});
-            const player = who === 'local' ? playerLocal : playerCloud;
-            const source = who === 'cloud' ? 'cloud' : 'local';
-            // Poll for the specific source file and play when available
-            (async function pollAndPlay(){
-              const deadline = Date.now() + 30000; // 30s timeout
-              while(Date.now() < deadline){
-                try{
-                  const fileResp = await fetch(`/api/tts/file/${job}?source=${source}`);
-                  if (fileResp.ok){
-                    const ab = await fileResp.arrayBuffer();
-                    const blob = new Blob([ab], { type: fileResp.headers.get('Content-Type') || 'audio/mpeg' });
-                    const url = URL.createObjectURL(blob);
-                    if (player){
-                      player.src = url;
-                      try{ await player.play(); }catch(e){}
-                    }
-                    return;
-                  }
-                }catch(e){ /* ignore and retry */ }
-                await new Promise(r=>setTimeout(r, 500));
-              }
-              console.warn('TTS file not available for', job, source);
-            })();
-          }
+          const player = who === 'local' ? playerLocal : playerCloud;
+          const source = who === 'cloud' ? 'cloud' : 'local';
+          // Use streaming consumer to play per-sentence audio as it arrives
+          try{
+            streamTtsSentencesViaFetch(safeSpeak, source, voice, player, promptStart).catch(e=>{ console.warn('streaming TTS failed', e); });
+          }catch(e){ console.warn('streamTtsSentencesViaFetch error', e); }
         }
       }catch(e){ console.warn('Auto TTS error', e); }
     }catch(e){
@@ -356,39 +344,23 @@ async function startTTS(text, voice){
 
 // Poll TTS job status and render timing block above the thermostat target
 async function monitorTTSStatus(job_id, who){
-  const displayId = who === 'local' ? 'tts-timings-local' : 'tts-timings-cloud';
-  const el = document.getElementById(displayId);
-  if (!el) return;
   const deadline = Date.now() + 30000;
   while(Date.now() < deadline){
     try{
       const resp = await fetch(`/api/tts/status?job_id=${encodeURIComponent(job_id)}`);
-      if (!resp.ok) { el.textContent = ''; break; }
+      if (!resp.ok) { break; }
       const j = await resp.json().catch(()=>null);
-      if (!j || !j.job) { el.textContent = ''; break; }
+      if (!j || !j.job) { break; }
       const t = j.job.timings || {};
-      // Only show the timing for the relevant provider in the top timing block
       const srcTiming = t[who] && typeof t[who].duration_ms !== 'undefined' ? t[who].duration_ms : null;
-      el.textContent = srcTiming != null ? `TTS: ${who} ${srcTiming}ms` : '';
-      // Persist the TTS timing into the matching persistent metrics block (local->metrics-local, cloud->metrics-cloud)
-      try{
-        const metricsId = who === 'local' ? 'metrics-local' : 'metrics-cloud';
-        const mid = document.getElementById(metricsId);
-        if (mid){
-          // Append or update the TTS section for this source only
-          const existing = (mid.textContent || '').replace(/\s*•\s*TTS:.*$/,'').trim();
-          const ttsText = srcTiming != null ? `TTS: ${who} ${srcTiming}ms` : '';
-          mid.textContent = existing ? (ttsText ? `${existing} • ${ttsText}` : existing) : ttsText;
-        }
-      }catch(e){/*ignore*/}
+      // Persist the TTS timing into the matching persistent metrics block only
+      try{ _metricsSet(who, 'tts', srcTiming); }catch(e){}
       // stop early if both providers finished
       const s = j.job.status || {};
       if ((s.local && s.local !== 'pending') && (s.cloud && s.cloud !== 'pending')) break;
     }catch(e){ console.warn('monitorTTSStatus', e); }
     await new Promise(r=>setTimeout(r, 400));
   }
-  // clear the top timing display after a short delay but keep persistent metrics intact
-  setTimeout(()=>{ try{ const tEl = document.getElementById(who === 'local' ? 'tts-timings-local' : 'tts-timings-cloud'); if (tEl) tEl.textContent = ''; }catch(e){} }, 5000);
 }
 
 async function fetchTTSStreamAndPlay(job_id, playerEl){
@@ -410,15 +382,244 @@ async function fetchTTSStreamAndPlay(job_id, playerEl){
   return source;
 }
 
+
+// Stream per-sentence TTS via POST streaming and play incrementally
+async function streamTtsSentencesViaFetch(text, source='local', voice=undefined, playerEl=null, ttfaStart=null){
+  // Creates a queue of audio blobs and plays them sequentially as they arrive.
+  const queue = [];
+  const collected = []; // all received blobs in order
+  let playing = false;
+  let firstSentReceived = false;
+
+  function playNext(){
+    if (playing) return;
+    if (queue.length === 0) return;
+    const item = queue.shift();
+    playing = true;
+    playerEl.src = item.url;
+    playerEl.play().catch(()=>{});
+    playerEl.onended = () => {
+      // Do NOT revoke chunk object URL here; keep blobs around until final stitching completes
+      playing = false;
+      // small grace to allow next chunk to be set
+      setTimeout(playNext, 50);
+    };
+  }
+
+  const controller = new AbortController();
+  const payload = { text };
+  if (source) payload.source = source;
+  if (voice) payload.voice = voice;
+
+  const res = await fetch('/api/tts/stream_sentences', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload),
+    signal: controller.signal
+  });
+  if (!res.ok) throw new Error('TTS stream request failed');
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buf = '';
+  let finalAudioUrl = null;
+  let finalAudioBlobFromServer = null;
+
+  const parseSSEChunk = (chunk) => {
+    // chunk is text appended; split into complete event blocks by double newline
+    const parts = chunk.split('\n\n');
+    for (let i=0;i<parts.length-1;i++){
+      const block = parts[i].trim();
+      if (!block) continue;
+      const lines = block.split('\n');
+      let evt = 'message';
+      let data = '';
+      for (const L of lines){
+        if (L.startsWith('event:')) evt = L.replace(/^event:\s*/,'').trim();
+        else if (L.startsWith('data:')) data += L.replace(/^data:\s*/,'') + '\n';
+      }
+      data = data.trim();
+      handleSSEEvent(evt, data);
+    }
+    return parts[parts.length-1];
+  };
+
+  const handleSSEEvent = (evt, data) => {
+    try{
+      if (evt === 'sentence'){
+        const payload = JSON.parse(data);
+        const b64 = payload.audio_data || payload.audio || '';
+        if (!b64) return;
+        // decode base64 to Uint8Array
+        const binStr = atob(b64);
+        const len = binStr.length;
+        const arr = new Uint8Array(len);
+        for (let i=0;i<len;i++) arr[i] = binStr.charCodeAt(i);
+        const u8 = new Uint8Array(arr); // copy bytes
+        const blob = new Blob([u8.buffer], { type: 'audio/mpeg' });
+        const url = URL.createObjectURL(blob);
+        queue.push({ url, blob });
+        collected.push(u8);
+        console.debug('[TTS stream] received sentence', payload.index, 'bytes', u8.byteLength, 'collectedCount', collected.length);
+        // compute TTFA when first sentence arrives
+        if (!firstSentReceived){
+          firstSentReceived = true;
+          try{
+            if (ttfaStart){ const ms = Date.now() - Number(ttfaStart); _metricsSet(source, 'ttfa', ms); }
+          }catch(e){/*ignore*/}
+        }
+        // start playing if idle
+        playNext();
+      } else if (evt === 'final_audio'){
+        // data contains url; record the server-side final audio URL but do not fetch it
+        // immediately. We wait until the entire stream completes to avoid racing with
+        // server-side file writes. On stream completion we'll prefer fetching this URL
+        // as the authoritative final audio; otherwise we'll fall back to client-side
+        // concatenation of received chunks.
+        try{
+          const obj = JSON.parse(data);
+          if (obj && obj.url){ finalAudioUrl = obj.url; console.debug('[TTS stream] final_audio url', finalAudioUrl); }
+        }catch(e){ console.warn('final_audio parse failed', e); }
+      } else if (evt === 'final_audio_bytes'){
+        // full audio bytes encoded as base64 from the server; prefer this if present
+        try{
+          const obj = JSON.parse(data);
+          const b64 = obj && obj.audio_data;
+          if (b64){
+            const binStr = atob(b64);
+            const len = binStr.length;
+            const arr = new Uint8Array(len);
+            for (let i=0;i<len;i++) arr[i] = binStr.charCodeAt(i);
+            const blob = new Blob([arr.buffer], { type: obj.mime_type || 'audio/mpeg' });
+            try{ finalAudioBlobFromServer = URL.createObjectURL(blob); }catch(e){ finalAudioBlobFromServer = null; }
+            console.debug('[TTS stream] received final_audio_bytes length', len, 'finalAudioBlobFromServer', finalAudioBlobFromServer);
+          }
+        }catch(e){ console.warn('final_audio_bytes parse failed', e); }
+      } else if (evt === 'tts_metrics'){
+        // optional: render metrics
+        try{ const m = JSON.parse(data); console.log('tts_metrics', m); }catch(e){}
+      } else if (evt === 'app_error'){
+        try{ const e = JSON.parse(data); console.warn('TTS stream error', e); }catch(e){ console.warn('TTS stream error', data); }
+      }
+    }catch(e){ console.error('handleSSEEvent', e); }
+  };
+
+  try{
+    while(true){
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      // process complete SSE blocks
+      buf = parseSSEChunk(buf);
+    }
+    if (buf && buf.trim()) parseSSEChunk(buf + '\n\n');
+  }catch(e){ console.warn('streamTtsSentencesViaFetch read error', e); }
+  finally{
+    controller.abort();
+  }
+  // When the stream completes, assemble collected blobs into a single full audio
+  try{
+    if (!playerEl) return;
+
+    console.debug('[TTS stream] finalize: collected chunks', collected.length);
+    // Always assemble a client-side full audio from collected chunks
+    let clientFull = null;
+    let clientFullUrl = null;
+    if (collected.length){
+      let total = 0;
+      for (const c of collected) total += c.byteLength;
+      const fullArr = new Uint8Array(total);
+      let offset = 0;
+      for (const c of collected){ fullArr.set(c, offset); offset += c.byteLength; }
+      clientFull = new Blob([fullArr.buffer], { type: 'audio/mpeg' });
+      clientFullUrl = URL.createObjectURL(clientFull);
+    }
+
+    // Assemble client-side full audio from collected chunks and expose it to the
+    // player for manual replay, but do NOT autoplay it. We still stream chunks
+    // as they arrive; this step only sets the final file once the streamed
+    // playback has completed to avoid repeating audio.
+    const clientFinalUrl = clientFullUrl;
+    const serverFinalUrl = finalAudioBlobFromServer || null;
+
+    // Helper: wait until the streaming playback queue is drained and the player
+    // is idle (not currently playing). Then set the player's src to the final
+    // combined file but do not call play(). If a server-provided blob exists and
+    // is larger than the client-assembled file, prefer it.
+    (async function waitAndExposeFinal(){
+      const maxWaitMs = 30000;
+      const start = Date.now();
+      while(true){
+        // idle condition: no queued incremental chunks and not playing
+        if ((!queue || queue.length === 0) && !playing) break;
+        if ((Date.now() - start) > maxWaitMs) break;
+        await new Promise(r => setTimeout(r, 100));
+      }
+
+      // decide which final URL to use
+      let chosen = clientFinalUrl;
+      try{
+        if (serverFinalUrl && chosen){
+          // try to compare sizes; fetch server blob headers if possible
+          try{
+            const resp = await fetch(serverFinalUrl, { method: 'HEAD' });
+            if (resp && resp.ok){
+              const sLen = parseInt(resp.headers.get('Content-Length') || '0', 10) || 0;
+              const cLen = (clientFull && clientFull.size) ? clientFull.size : (clientFinalUrl ? 0 : 0);
+              if (sLen >= cLen && sLen > 0) chosen = serverFinalUrl;
+            } else {
+              // fallback: prefer server blob if available
+              chosen = serverFinalUrl;
+            }
+          }catch(e){
+            chosen = serverFinalUrl;
+          }
+        }
+      }catch(e){/*ignore*/}
+
+      if (chosen){
+        try{ playerEl.src = chosen; }catch(e){ console.warn('set final src failed', e); }
+        // mark final availability so UI can show it if needed
+        try{ playerEl.dataset.finalAvailable = '1'; }catch(e){}
+      }
+    })();
+  }catch(e){ console.warn('streamTtsSentencesViaFetch finalize error', e); }
+}
+
+// Expose helper for debugging in console
+window.streamTtsSentencesViaFetch = streamTtsSentencesViaFetch;
+
+
+
 // Sanitize assistant content before sending to summarizer or TTS
 function sanitizeForTTS(s){
   try{
     if (!s) return '';
-    let out = String(s);
-    // remove common serialized toolcall artifacts like "tool:null" or "tool: null"
-    out = out.replace(/tool\s*:\s*null/gi, '');
+    let out = String(s).trim();
+    // If the string is a JSON wrapper like {"tool":null,"reply":"..."}, try to extract reply/content
+    try{
+      const j = JSON.parse(out);
+      if (j && typeof j === 'object'){
+        for (const k of ['reply','content','text','message']){
+          if (k in j && j[k]) return String(j[k]).trim();
+        }
+        // If this looks like a pure tool-invocation (no content fields), skip it
+        const toolLike = Object.keys(j).some(k => {
+          const lk = String(k).toLowerCase();
+          return lk === 'tool' || lk === 'action' || lk === 'command' || lk.endsWith('_length') || lk.endsWith('_size') || lk === 'tool_name';
+        });
+        if (toolLike) return '';
+        // fallback: join string-valued properties
+        const vals = Object.values(j).filter(v => typeof v === 'string' && v.trim()).map(v => v.trim());
+        if (vals.length) return vals.join(' ');
+      }
+    }catch(e){ /* not JSON */ }
+
+    // remove common serialized toolcall artifacts like "tool:null" or "tool: null", covering quoted keys
+    out = out.replace(/\"?tool\"?\s*:\s*null,?/gi, '');
+    out = out.replace(/\"?tool\"?\s*:\s*\"[^\"]*\"\s*,?/gi, '');
     // remove any leading 'tool:...' tokens on their own lines
-    out = out.split('\n').filter(line => !/^\s*tool\s*:/i.test(line)).join('\n');
+    out = out.split('\n').filter(line => !/^\s*\"?tool\"?\s*:/i.test(line)).join('\n');
     // collapse multiple whitespace and trim
     out = out.replace(/\s+/g,' ').trim();
     return out;
@@ -574,43 +775,25 @@ recStartBtn.addEventListener('click', async ()=>{
               // Metrics: persistent block below blurb
               try{
                 const mid = document.getElementById('metrics-local');
-                if (mid) mid.textContent = `${sttMsVal != null ? 'STT: ' + sttMsVal + 'ms' : ''}${sttMsVal != null && localModelResult.ms ? ' • ' : ''}${localModelResult.ms ? 'LLM: ' + localModelResult.ms + 'ms' : ''}`;
+                if (mid){ _metricsSet('local', 'stt', sttMsVal); _metricsSet('local', 'llm', localModelResult.ms); }
               }catch(e){}
               if (localModelResult.applied) await fetchStateFor('local');
-                  // Auto-TTS: summarize and play the post-tool-call summary for local model
+                  // Auto-TTS: only summarize when a tool call was performed; otherwise speak LLM content directly
                   try{
                     const safeText = sanitizeForTTS(c);
                     let textToSpeak = null;
-                    try{
-                      const sumResp = await fetch('/api/tts/summarize', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: safeText, applied: localModelResult.applied, prefer: 'local', user_prompt: localText }) });
-                      if (sumResp.ok){ const sj = await sumResp.json().catch(()=>null); if (sj && sj.summary) textToSpeak = sj.summary; }
-                    }catch(e){ console.warn('local summarize failed', e); }
-                    if (!textToSpeak) textToSpeak = composeSummary(localModelResult.parsed, localModelResult.applied, safeText);
+                    if (localModelResult.applied && typeof localModelResult.applied === 'object' && Object.keys(localModelResult.applied).length > 0){
+                      try{
+                        const sumResp = await fetch('/api/tts/summarize', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: safeText, applied: localModelResult.applied, prefer: 'local', user_prompt: localText }) });
+                        if (sumResp.ok){ const sj = await sumResp.json().catch(()=>null); if (sj && sj.summary) textToSpeak = sj.summary; }
+                      }catch(e){ console.warn('local summarize failed', e); }
+                      if (!textToSpeak) textToSpeak = composeSummary(localModelResult.parsed, localModelResult.applied, safeText);
+                    } else {
+                      textToSpeak = safeText;
+                    }
                     if (textToSpeak){
-                      const start = await startTTS(sanitizeForTTS(textToSpeak), undefined).catch(()=>null);
-                      if (start && start.ok){
-                        const job = start.job_id;
-                        // show timing metrics for local
-                        monitorTTSStatus(job, 'local').catch(()=>{});
-                        (async function pollPlayLocal(){
-                          const deadline = Date.now() + 30000; // wait up to 30s for local audio
-                          while(Date.now() < deadline){
-                            try{
-                              const fileResp = await fetch(`/api/tts/file/${job}?source=local`);
-                              if (fileResp.ok){
-                                const ab = await fileResp.arrayBuffer();
-                                const blob = new Blob([ab], { type: fileResp.headers.get('Content-Type') || 'audio/mpeg' });
-                                const url = URL.createObjectURL(blob);
-                                playerLocal.src = url;
-                                try{ await playerLocal.play(); }catch(e){}
-                                return;
-                              }
-                            }catch(e){ /* ignore and retry */ }
-                            await new Promise(r=>setTimeout(r, 500));
-                          }
-                          console.warn('Local TTS file not available for', job);
-                        })();
-                      }
+                      const safe = sanitizeForTTS(textToSpeak);
+                      try{ streamTtsSentencesViaFetch(safe, 'local', undefined, playerLocal, startTs).catch(()=>{}); }catch(e){ console.warn('streaming local TTS failed', e); }
                     }
                   }catch(e){ console.warn('local auto-TTS failed', e); }
             }catch(e){ localPanel.textContent = `Local LLM error: ${e}`; }
@@ -639,43 +822,25 @@ recStartBtn.addEventListener('click', async ()=>{
               // Metrics: persistent block below blurb
               try{
                 const mid = document.getElementById('metrics-cloud');
-                if (mid) mid.textContent = `${sttMsVal2 != null ? 'STT: ' + sttMsVal2 + 'ms' : ''}${sttMsVal2 != null && cloudModelResult.ms ? ' • ' : ''}${cloudModelResult.ms ? 'LLM: ' + cloudModelResult.ms + 'ms' : ''}`;
+                if (mid){ _metricsSet('cloud', 'stt', sttMsVal2); _metricsSet('cloud', 'llm', cloudModelResult.ms); }
               }catch(e){}
               if (cloudModelResult.applied) await fetchStateFor('cloud');
-                  // Auto-TTS: summarize and play the post-tool-call summary for cloud model
+                  // Auto-TTS: only summarize when a tool call was performed; otherwise speak LLM content directly
                   try{
                     const safeText = sanitizeForTTS(c2);
                     let textToSpeak = null;
-                    try{
-                      const sumResp = await fetch('/api/tts/summarize', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: safeText, applied: cloudModelResult.applied, prefer: 'cloud', user_prompt: cloudText }) });
-                      if (sumResp.ok){ const sj = await sumResp.json().catch(()=>null); if (sj && sj.summary) textToSpeak = sj.summary; }
-                    }catch(e){ console.warn('cloud summarize failed', e); }
-                    if (!textToSpeak) textToSpeak = composeSummary(cloudModelResult.parsed, cloudModelResult.applied, safeText);
+                    if (cloudModelResult.applied && typeof cloudModelResult.applied === 'object' && Object.keys(cloudModelResult.applied).length > 0){
+                      try{
+                        const sumResp = await fetch('/api/tts/summarize', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: safeText, applied: cloudModelResult.applied, prefer: 'cloud', user_prompt: cloudText }) });
+                        if (sumResp.ok){ const sj = await sumResp.json().catch(()=>null); if (sj && sj.summary) textToSpeak = sj.summary; }
+                      }catch(e){ console.warn('cloud summarize failed', e); }
+                      if (!textToSpeak) textToSpeak = composeSummary(cloudModelResult.parsed, cloudModelResult.applied, safeText);
+                    } else {
+                      textToSpeak = safeText;
+                    }
                     if (textToSpeak){
-                      const start = await startTTS(sanitizeForTTS(textToSpeak), 'sage').catch(()=>null);
-                      if (start && start.ok){
-                        const job = start.job_id;
-                        // show timing metrics for cloud
-                        monitorTTSStatus(job, 'cloud').catch(()=>{});
-                        (async function pollPlayCloud(){
-                          const deadline = Date.now() + 30000; // wait up to 30s for cloud audio
-                          while(Date.now() < deadline){
-                            try{
-                              const fileResp = await fetch(`/api/tts/file/${job}?source=cloud`);
-                              if (fileResp.ok){
-                                const ab = await fileResp.arrayBuffer();
-                                const blob = new Blob([ab], { type: fileResp.headers.get('Content-Type') || 'audio/mpeg' });
-                                const url = URL.createObjectURL(blob);
-                                playerCloud.src = url;
-                                try{ await playerCloud.play(); }catch(e){}
-                                return;
-                              }
-                            }catch(e){ /* ignore and retry */ }
-                            await new Promise(r=>setTimeout(r, 500));
-                          }
-                          console.warn('Cloud TTS file not available for', job);
-                        })();
-                      }
+                      const safe = sanitizeForTTS(textToSpeak);
+                      try{ streamTtsSentencesViaFetch(safe, 'cloud', 'sage', playerCloud, startTs).catch(()=>{}); }catch(e){ console.warn('streaming cloud TTS failed', e); }
                     }
                   }catch(e){ console.warn('cloud auto-TTS failed', e); }
             }catch(e){ cloudPanel.textContent = `Cloud LLM error: ${e}`; }
