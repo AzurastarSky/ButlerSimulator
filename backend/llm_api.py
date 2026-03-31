@@ -143,6 +143,12 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
                     inferred = local_llm.infer_thermo_step(last_user_text)
                     if inferred is not None:
                         value = inferred
+                        # record that we inferred a value so callers can see what was used
+                        try:
+                            js['value'] = inferred
+                            js['_inferred_value'] = True
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
@@ -152,11 +158,12 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
                 step = float(value)
             except:
                 pass
-
+        # record previous target for clearer return data
+        prev_target = float(house_store.get("target", 20.0))
         if action == "increase":
-            house_store["target"] = clamp(house_store["target"] + step, 10.0, 28.0)
+            house_store["target"] = clamp(prev_target + step, 10.0, 28.0)
         elif action == "decrease":
-            house_store["target"] = clamp(house_store["target"] - step, 10.0, 28.0)
+            house_store["target"] = clamp(prev_target - step, 10.0, 28.0)
         elif action == "set_value":
             try:
                 num = float(value)
@@ -180,7 +187,14 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
         except Exception:
             pass
 
-        return {"ok": True, "device": "thermostat", "action": action, "house": house_store}
+        # Return the numeric step/value used and previous/new targets for clarity
+        used_value = None
+        try:
+            used_value = float(value) if value is not None else step
+        except Exception:
+            used_value = step
+
+        return {"ok": True, "device": "thermostat", "action": action, "used_value": used_value, "prev_target": prev_target, "new_target": float(house_store.get("target", prev_target)), "house": house_store}
 
     if device not in {"light"}:
         return {"ok": False, "error": f"Unsupported device for target: {device}"}

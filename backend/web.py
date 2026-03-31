@@ -651,6 +651,12 @@ def api_tts_summarize():
         "Assistant content: Done — I've turned on the living room light.\n"
         "Applied: {\"room\":\"living room\",\"new_state\":\"on\"}\n"
         "Spoken summary: I have turned on the living room light.\n\n"
+        "Assistant content: Done — I've increased the thermostat in the bedroom by 2 degrees.\n"
+        "Applied: {\"room\":\"bedroom\",\"device\":\"thermostat\",\"action\":\"increase\",\"value\":\"2\"}\n"
+        "Spoken summary: I have increased the thermostat by 2 degrees.\n\n"
+        "Assistant content: Done — I've set the thermostat to 22 degrees.\n"
+        "Applied: {\"room\":\"upstairs\",\"device\":\"thermostat\",\"action\":\"set_value\",\"value\":\"72\"}\n"
+        "Spoken summary: I set the thermostat to 22 degrees.\n\n"
         "Rules: If 'applied' includes 'all' or 4+ rooms, say 'I have turned on all the lights'.\n"
         "When listing rooms, use 'the' before room names and list up to three rooms, joining with commas and 'and'.\n"
         "Keep output short and directly suitable for TTS."
@@ -759,6 +765,12 @@ def api_tts_summarize_stream():
         "Assistant content: Done — I've turned on the living room light.\n"
         "Applied: {\"room\":\"living room\",\"new_state\":\"on\"}\n"
         "Spoken summary: I have turned on the living room light.\n\n"
+        "Assistant content: Done — I've increased the thermostat in the bedroom by 2 degrees.\n"
+        "Applied: {\"room\":\"bedroom\",\"device\":\"thermostat\",\"action\":\"increase\",\"value\":\"2\"}\n"
+        "Spoken summary: I have increased the thermostat by 2 degrees in the bedroom.\n\n"
+        "Assistant content: Done — I've set the thermostat to 72 degrees upstairs.\n"
+        "Applied: {\"room\":\"upstairs\",\"device\":\"thermostat\",\"action\":\"set_value\",\"value\":\"72\"}\n"
+        "Spoken summary: I set the thermostat to 72 degrees upstairs.\n\n"
         "Rules: If 'applied' includes 'all' or 4+ rooms, say 'I have turned on all the lights'.\n"
         "When listing rooms, use 'the' before room names and list up to three rooms, joining with commas and 'and'.\n"
         "Keep output short and directly suitable for TTS."
@@ -796,10 +808,15 @@ def api_tts_summarize_stream():
     def gen():
         run_id = uuid.uuid4().hex
         parts = []
+        parts_lock = threading.Lock()
         idx = 0
         buffer = ''
         stream_id = uuid.uuid4().hex
         src = 'cloud' if chosen == 'cloud' else 'local'
+        # executor + queue for non-blocking per-sentence synthesis
+        synth_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        synth_done_q = queue.Queue()
+        pending_futures = []
         try:
             print(f"[summarize_stream][{run_id}] starting using model={chosen} src={src}", flush=True)
         except Exception:
@@ -857,50 +874,77 @@ def api_tts_summarize_stream():
                         for sent in sentences:
                             try:
                                 try:
-                                    print(f"[summarize_stream][{run_id}] synth idx={idx} start (src={src})", flush=True)
+                                    print(f"[summarize_stream][{run_id}] scheduling synth idx={idx} (src={src})", flush=True)
                                 except Exception:
                                     pass
-                                t0 = time.perf_counter()
-                                if src == 'cloud':
-                                    if not tts.cloud_tts_provider:
-                                        raise RuntimeError('cloud TTS provider not configured')
-                                    audio = tts.cloud_tts_provider.synthesize_speech(sent, None)
-                                else:
-                                    if not tts.local_tts_provider:
-                                        raise RuntimeError('local TTS provider not configured')
-                                    audio = tts.local_tts_provider.synthesize_speech(sent, None)
-                                t1 = time.perf_counter()
-                                tts_ms = (t1 - t0) * 1000.0
+
+                                def _synth_and_save(sent_text=sent, idx_local=idx, src_local=src, run_id_local=run_id, sid=stream_id):
+                                    tts_start = time.perf_counter()
+                                    if src_local == 'cloud':
+                                        if not tts.cloud_tts_provider:
+                                            raise RuntimeError('cloud TTS provider not configured')
+                                        audio_local = tts.cloud_tts_provider.synthesize_speech(sent_text, None)
+                                    else:
+                                        if not tts.local_tts_provider:
+                                            raise RuntimeError('local TTS provider not configured')
+                                        audio_local = tts.local_tts_provider.synthesize_speech(sent_text, None)
+                                    tts_end = time.perf_counter()
+                                    tts_ms_local = (tts_end - tts_start) * 1000.0
+                                    try:
+                                        chunk_path = tts._save_chunk_audio(run_id_local, idx_local, src_local, audio_local)
+                                        with tts._TTS_JOB_LOCK:
+                                            job = tts.JOBS.get(run_id_local) or {}
+                                            job.setdefault('chunks', []).append(chunk_path)
+                                            tts.JOBS[run_id_local] = job
+                                    except Exception:
+                                        pass
+                                    b = bytes(audio_local)
+                                    with parts_lock:
+                                        parts.append(b)
+                                    return {'index': idx_local, 'audio': b, 'text': sent_text, 'tts_ms': tts_ms_local, 'source': src_local, 'model': src_local, 'stream_id': sid}
+
+                                fut = synth_executor.submit(_synth_and_save)
+
+                                def _on_done(futobj):
+                                    try:
+                                        res = futobj.result()
+                                        synth_done_q.put({'type': 'sentence', 'res': res})
+                                    except Exception as e:
+                                        synth_done_q.put({'type': 'synth_error', 'error': str(e)})
+
+                                fut.add_done_callback(_on_done)
+                                pending_futures.append(fut)
+
+                                # notify clients that a TTS task was queued for this summary sentence
                                 try:
-                                    print(f"[summarize_stream][{run_id}] synth idx={idx} done bytes={len(bytes(audio))}", flush=True)
+                                    yield f"event: tts_queued\ndata: {json.dumps({'model': src, 'stream_id': stream_id, 'index': idx})}\n\n"
                                 except Exception:
                                     pass
                             except Exception as e:
                                 try:
-                                    yield f"event: app_error\ndata: {json.dumps({'message': 'TTS failed', 'error': str(e)})}\n\n"
+                                    yield f"event: app_error\ndata: {json.dumps({'message': 'TTS scheduling failed', 'error': str(e)})}\n\n"
                                 except Exception:
                                     pass
-                                continue
-                            try:
-                                parts.append(bytes(audio))
-                                try:
-                                    chunk_path = tts._save_chunk_audio(run_id, idx, src, audio)
-                                    with tts._TTS_JOB_LOCK:
-                                        job = tts.JOBS.get(run_id) or {}
-                                        job.setdefault('chunks', []).append(chunk_path)
-                                        tts.JOBS[run_id] = job
-                                except Exception:
-                                    pass
-                                audio_b64 = base64.b64encode(bytes(audio)).decode('utf-8')
-                                yield f"event: sentence\ndata: {json.dumps({'index': idx, 'audio_data': audio_b64, 'mime_type': 'audio/mpeg', 'text': sent, 'tts_ms': tts_ms, 'source': src, 'model': src, 'stream_id': stream_id})}\n\n"
-                            except Exception:
-                                pass
-                            try:
-                                print(f"[summarize_stream][{run_id}] yielded sentence idx={idx}", flush=True)
-                            except Exception:
-                                pass
                             idx += 1
                         buffer = remainder
+                    # drain any completed synths and yield sentence events
+                    while True:
+                        try:
+                            done_item = synth_done_q.get_nowait()
+                        except Exception:
+                            break
+                        if done_item.get('type') == 'sentence':
+                            r = done_item.get('res') or {}
+                            try:
+                                audio_b64 = base64.b64encode(r.get('audio')).decode('utf-8')
+                                yield f"event: sentence\ndata: {json.dumps({'index': r.get('index'), 'audio_data': audio_b64, 'mime_type': 'audio/mpeg', 'text': r.get('text'), 'tts_ms': r.get('tts_ms'), 'source': r.get('source'), 'model': r.get('model'), 'stream_id': r.get('stream_id')})}\n\n"
+                            except Exception:
+                                pass
+                        elif done_item.get('type') == 'synth_error':
+                            try:
+                                yield f"event: app_error\ndata: {json.dumps({'message': 'TTS synth error', 'error': done_item.get('error')})}\n\n"
+                            except Exception:
+                                pass
 
                 # final model event with full content
                 try:
@@ -913,8 +957,8 @@ def api_tts_summarize_stream():
                 if not getattr(llm_api, 'local_llm', None):
                     yield f"event: app_error\ndata: {json.dumps({'message': 'local LLM not configured'})}\n\n"
                 else:
-                    sys_prompt = llm_api.local_llm.SYSTEM_PROMPT if hasattr(llm_api.local_llm, 'SYSTEM_PROMPT') else ''
-                    msgs = [{'role': 'system', 'content': sys_prompt}, {'role': 'user', 'content': user_msg}]
+                    # Use the summarizer-specific system prompt (not the generic assistant prompt)
+                    msgs = [{'role': 'system', 'content': system_msg}, {'role': 'user', 'content': user_msg}]
                     payload = {'model': getattr(llm_api.local_llm, 'MODEL', None) or 'local', 'messages': msgs, 'stream': True, 'temperature': 0}
                     url = getattr(llm_api.local_llm, 'LLM_SERVER_URL', None)
                     if not url:
@@ -953,43 +997,77 @@ def api_tts_summarize_stream():
                             if sentences:
                                 for sent in sentences:
                                     try:
-                                        yield f"event: tts_queued\ndata: {json.dumps({'model': src, 'stream_id': stream_id})}\n\n"
-                                    except Exception:
-                                        pass
-                                    try:
-                                        t0 = time.perf_counter()
-                                        if src == 'cloud':
-                                            if not tts.cloud_tts_provider:
-                                                raise RuntimeError('cloud TTS provider not configured')
-                                            audio = tts.cloud_tts_provider.synthesize_speech(sent, None)
-                                        else:
-                                            if not tts.local_tts_provider:
-                                                raise RuntimeError('local TTS provider not configured')
-                                            audio = tts.local_tts_provider.synthesize_speech(sent, None)
-                                        t1 = time.perf_counter()
-                                        tts_ms = (t1 - t0) * 1000.0
+                                        try:
+                                            print(f"[summarize_stream][{run_id}] scheduling synth idx={idx} (src={src})", flush=True)
+                                        except Exception:
+                                            pass
+
+                                        def _synth_and_save_local(sent_text=sent, idx_local=idx, src_local=src, run_id_local=run_id, sid=stream_id):
+                                            tts_start = time.perf_counter()
+                                            if src_local == 'cloud':
+                                                if not tts.cloud_tts_provider:
+                                                    raise RuntimeError('cloud TTS provider not configured')
+                                                audio_local = tts.cloud_tts_provider.synthesize_speech(sent_text, None)
+                                            else:
+                                                if not tts.local_tts_provider:
+                                                    raise RuntimeError('local TTS provider not configured')
+                                                audio_local = tts.local_tts_provider.synthesize_speech(sent_text, None)
+                                            tts_end = time.perf_counter()
+                                            tts_ms_local = (tts_end - tts_start) * 1000.0
+                                            try:
+                                                chunk_path = tts._save_chunk_audio(run_id_local, idx_local, src_local, audio_local)
+                                                with tts._TTS_JOB_LOCK:
+                                                    job = tts.JOBS.get(run_id_local) or {}
+                                                    job.setdefault('chunks', []).append(chunk_path)
+                                                    tts.JOBS[run_id_local] = job
+                                            except Exception:
+                                                pass
+                                            b = bytes(audio_local)
+                                            with parts_lock:
+                                                parts.append(b)
+                                            return {'index': idx_local, 'audio': b, 'text': sent_text, 'tts_ms': tts_ms_local, 'source': src_local, 'model': src_local, 'stream_id': sid}
+
+                                        fut = synth_executor.submit(_synth_and_save_local)
+
+                                        def _on_done_local(futobj):
+                                            try:
+                                                res = futobj.result()
+                                                synth_done_q.put({'type': 'sentence', 'res': res})
+                                            except Exception as e:
+                                                synth_done_q.put({'type': 'synth_error', 'error': str(e)})
+
+                                        fut.add_done_callback(_on_done_local)
+                                        pending_futures.append(fut)
+
+                                        try:
+                                            yield f"event: tts_queued\ndata: {json.dumps({'model': src, 'stream_id': stream_id, 'index': idx})}\n\n"
+                                        except Exception:
+                                            pass
                                     except Exception as e:
                                         try:
-                                            yield f"event: app_error\ndata: {json.dumps({'message': 'TTS failed', 'error': str(e)})}\n\n"
+                                            yield f"event: app_error\ndata: {json.dumps({'message': 'TTS scheduling failed', 'error': str(e)})}\n\n"
                                         except Exception:
                                             pass
-                                        continue
-                                    try:
-                                        parts.append(bytes(audio))
-                                        try:
-                                            chunk_path = tts._save_chunk_audio(run_id, idx, src, audio)
-                                            with tts._TTS_JOB_LOCK:
-                                                job = tts.JOBS.get(run_id) or {}
-                                                job.setdefault('chunks', []).append(chunk_path)
-                                                tts.JOBS[run_id] = job
-                                        except Exception:
-                                            pass
-                                        audio_b64 = base64.b64encode(bytes(audio)).decode('utf-8')
-                                        yield f"event: sentence\ndata: {json.dumps({'index': idx, 'audio_data': audio_b64, 'mime_type': 'audio/mpeg', 'text': sent, 'tts_ms': tts_ms, 'source': src, 'model': src, 'stream_id': stream_id})}\n\n"
-                                    except Exception:
-                                        pass
                                     idx += 1
                                 buffer = remainder
+                            # drain any completed synths and yield sentence events
+                            while True:
+                                try:
+                                    done_item = synth_done_q.get_nowait()
+                                except Exception:
+                                    break
+                                if done_item.get('type') == 'sentence':
+                                    r = done_item.get('res') or {}
+                                    try:
+                                        audio_b64 = base64.b64encode(r.get('audio')).decode('utf-8')
+                                        yield f"event: sentence\ndata: {json.dumps({'index': r.get('index'), 'audio_data': audio_b64, 'mime_type': 'audio/mpeg', 'text': r.get('text'), 'tts_ms': r.get('tts_ms'), 'source': r.get('source'), 'model': r.get('model'), 'stream_id': r.get('stream_id')})}\n\n"
+                                    except Exception:
+                                        pass
+                                elif done_item.get('type') == 'synth_error':
+                                    try:
+                                        yield f"event: app_error\ndata: {json.dumps({'message': 'TTS synth error', 'error': done_item.get('error')})}\n\n"
+                                    except Exception:
+                                        pass
                         try:
                             yield f"event: model\ndata: {json.dumps({'model': 'summarizer', 'ok': True, 'content': buffer, 'stream_id': stream_id})}\n\n"
                         except Exception:
@@ -1000,6 +1078,37 @@ def api_tts_summarize_stream():
                 yield f"event: app_error\ndata: {json.dumps({'message': str(e)})}\n\n"
             except Exception:
                 pass
+
+        # allow a short grace period for pending synths to finish and emit their events
+        try:
+            try:
+                concurrent.futures.wait(pending_futures, timeout=2)
+            except Exception:
+                pass
+            # drain any remaining completed synths
+            while True:
+                try:
+                    done_item = synth_done_q.get_nowait()
+                except Exception:
+                    break
+                if done_item.get('type') == 'sentence':
+                    r = done_item.get('res') or {}
+                    try:
+                        audio_b64 = base64.b64encode(r.get('audio')).decode('utf-8')
+                        yield f"event: sentence\ndata: {json.dumps({'index': r.get('index'), 'audio_data': audio_b64, 'mime_type': 'audio/mpeg', 'text': r.get('text'), 'tts_ms': r.get('tts_ms'), 'source': r.get('source'), 'model': r.get('model'), 'stream_id': r.get('stream_id')})}\n\n"
+                    except Exception:
+                        pass
+                elif done_item.get('type') == 'synth_error':
+                    try:
+                        yield f"event: app_error\ndata: {json.dumps({'message': 'TTS synth error', 'error': done_item.get('error')})}\n\n"
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            synth_executor.shutdown(wait=False)
+        except Exception:
+            pass
 
         # persist final combined audio if we produced chunks
         try:

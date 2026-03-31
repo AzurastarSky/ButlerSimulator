@@ -56,7 +56,7 @@ Temperature intent rules:
 
 Examples:
 User: I am a little cold
-{"tool":"manage_device","room":"all","device":"thermostat","action":"increase"}
+{"tool":"manage_device","room":"all","device":"thermostat","action":"increase","value":"1","intensity":1}
 User: It is dim in the office.
 {"tool":"manage_device","room":"office","device":"light","action":"turn_on"}
 """
