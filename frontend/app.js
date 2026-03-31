@@ -564,14 +564,20 @@ async function streamTtsSentencesViaFetch(text, source='local', voice=undefined,
         if (serverFinalUrl && chosen){
           // try to compare sizes; fetch server blob headers if possible
           try{
-            const resp = await fetch(serverFinalUrl, { method: 'HEAD' });
-            if (resp && resp.ok){
-              const sLen = parseInt(resp.headers.get('Content-Length') || '0', 10) || 0;
-              const cLen = (clientFull && clientFull.size) ? clientFull.size : (clientFinalUrl ? 0 : 0);
-              if (sLen >= cLen && sLen > 0) chosen = serverFinalUrl;
-            } else {
-              // fallback: prefer server blob if available
+            // If the server provided a blob URL (object URL), browsers do not
+            // support network HEAD requests against blob: URLs — use it directly.
+            if (typeof serverFinalUrl === 'string' && serverFinalUrl.startsWith('blob:')){
               chosen = serverFinalUrl;
+            } else {
+              const resp = await fetch(serverFinalUrl, { method: 'HEAD' });
+              if (resp && resp.ok){
+                const sLen = parseInt(resp.headers.get('Content-Length') || '0', 10) || 0;
+                const cLen = (clientFull && clientFull.size) ? clientFull.size : (clientFinalUrl ? 0 : 0);
+                if (sLen >= cLen && sLen > 0) chosen = serverFinalUrl;
+              } else {
+                // fallback: prefer server blob if available
+                chosen = serverFinalUrl;
+              }
             }
           }catch(e){
             chosen = serverFinalUrl;

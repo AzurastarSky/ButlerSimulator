@@ -225,8 +225,95 @@ def api_chat_stream():
                     except Exception:
                         pass
 
+                # Emit the original model event (backwards-compatible) and then
+                # stream the assistant text sentence-by-sentence, synthesizing each
+                # sentence to audio on-the-fly, emitting SSE events for both text
+                # and audio chunks. This preserves the existing sentence-chunking
+                # behavior used by /api/tts/stream_sentences while also streaming
+                # the assistant text for faster TTFA.
                 payload = {'model': who, 'ok': True, 'content': content, 'parsed': parsed, 'applied': applied, 'ms': t}
-                yield f"event: model\ndata: {json.dumps(payload, default=str)}\n\n"
+                try:
+                    yield f"event: model\ndata: {json.dumps(payload, default=str)}\n\n"
+                except Exception:
+                    pass
+
+                run_id = uuid.uuid4().hex
+                tts._purge_old_job_files(except_job_id=run_id)
+                sentences, remainder = tts._extract_sentences(content)
+                if remainder.strip():
+                    sentences.append(remainder.strip())
+
+                parts = []
+                for idx, sentence in enumerate(sentences):
+                    # emit text fragment first for low-latency display
+                    try:
+                        yield f"event: model_text\ndata: {json.dumps({'model': who, 'index': idx, 'text': sentence, 'ms': t})}\n\n"
+                    except Exception:
+                        pass
+
+
+                    # synthesize audio for the sentence using the exact provider
+                    # matching the model (no cross-provider fallback allowed).
+                    a0 = time.perf_counter()
+                    audio_bytes = None
+                    source = None
+                    try:
+                        if who == 'cloud':
+                            if not tts.cloud_tts_provider:
+                                raise RuntimeError('cloud TTS provider not configured')
+                            audio_bytes = tts.cloud_tts_provider.synthesize_speech(sentence, None)
+                            source = 'cloud'
+                        elif who == 'local':
+                            if not tts.local_tts_provider:
+                                raise RuntimeError('local TTS provider not configured')
+                            audio_bytes = tts.local_tts_provider.synthesize_speech(sentence, None)
+                            source = 'local'
+                        else:
+                            raise RuntimeError(f'unknown model source: {who}')
+                        a1 = time.perf_counter()
+                    except Exception as e:
+                        a1 = time.perf_counter()
+                        audio_bytes = None
+                        yield f"event: app_error\ndata: {json.dumps({'message': f'TTS failed for sentence {idx}: {repr(e)}', 'model': who})}\n\n"
+                        continue
+
+                    parts.append(bytes(audio_bytes))
+                    try:
+                        # Use the actual provider source when saving chunk files
+                        chunk_src = source
+                        chunk_path = tts._save_chunk_audio(run_id, idx, chunk_src, audio_bytes)
+                        with tts._TTS_JOB_LOCK:
+                            job = tts.JOBS.get(run_id) or {}
+                            job.setdefault('chunks', []).append(chunk_path)
+                            tts.JOBS[run_id] = job
+                    except Exception:
+                        pass
+
+                    try:
+                        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+                        yield f"event: sentence\ndata: {json.dumps({'index': idx, 'audio_data': audio_b64, 'mime_type': 'audio/mpeg', 'text': sentence, 'tts_ms': (a1-a0)*1000.0, 'model': who, 'source': source})}\n\n"
+                    except Exception:
+                        pass
+
+                # persist combined audio for later retrieval
+                try:
+                    full = b''.join(parts)
+                    with tts._TTS_JOB_LOCK:
+                        tts.JOBS[run_id] = {'text': content, 'created_at': time.time()}
+                    save_path = tts._save_job_audio(run_id, who, full)
+                    with tts._TTS_JOB_LOCK:
+                        tts.JOBS[run_id][f"{who}_path"] = save_path
+                        tts.JOBS[run_id][f"{who}_bytes"] = full
+                        tts.JOBS[run_id][who] = full
+                        tts.JOBS[run_id]['status'] = {who: 'done'}
+                    yield f"event: final_audio\ndata: {json.dumps({'url': f'/api/tts/file/{run_id}?source={who}'})}\n\n"
+                    try:
+                        audio_b64_full = base64.b64encode(full).decode('utf-8')
+                        yield f"event: final_audio_bytes\ndata: {json.dumps({'audio_data': audio_b64_full, 'mime_type': 'audio/mpeg', 'model': who})}\n\n"
+                    except Exception:
+                        pass
+                except Exception:
+                    yield f"event: app_error\ndata: {json.dumps({'message': 'Failed to persist final audio'})}\n\n"
 
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
