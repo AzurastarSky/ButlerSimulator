@@ -25,6 +25,33 @@ const sttTranscriptEl = document.getElementById('stt-transcript');
 const playerLocal = document.getElementById('player-local');
 const playerCloud = document.getElementById('player-cloud');
 
+// Simple per-model playback queues for SSE audio chunks
+const _playQueues = { local: [], cloud: [] };
+const _playing = { local: false, cloud: false };
+
+function _enqueueAudioFor(who, blob){
+  if (!who) who = 'local';
+  const q = _playQueues[who] || [];
+  const url = URL.createObjectURL(blob);
+  q.push({ url, blob });
+  _playQueues[who] = q;
+  if (!_playing[who]) _playNextFor(who);
+}
+
+function _playNextFor(who){
+  const q = _playQueues[who] || [];
+  const player = who === 'local' ? playerLocal : playerCloud;
+  if (!q || q.length === 0){
+    _playing[who] = false;
+    return;
+  }
+  const item = q.shift();
+  _playQueues[who] = q;
+  _playing[who] = true;
+  try{ player.src = item.url; player.play().catch(()=>{}); }catch(e){ console.warn('play failed', e); }
+  player.onended = () => { setTimeout(()=> _playNextFor(who), 50); };
+}
+
 // Basic runtime debug hooks to help trace load-time errors
 console.log('app.js loaded');
 window.addEventListener('error', (ev) => {
@@ -274,11 +301,15 @@ function openRaceSSE(text){
   const url = `/api/chat/stream?user=${encodeURIComponent(text)}`;
   const promptStart = Date.now();
   const es = new EventSource(url);
+  let esStreamId = null;
+  let sawSentence = false;
   ensureRespEl('local').textContent = 'waiting...';
   ensureRespEl('cloud').textContent = 'waiting...';
   es.addEventListener('model', async (ev) => {
     try{
       const data = JSON.parse(ev.data);
+      // record stream id for this EventSource
+      try{ if (data.stream_id) esStreamId = data.stream_id; }catch(e){}
       const who = data.model; // 'local' or 'cloud'
       const ms = data.ms;
       const content = data.content || '';
@@ -295,13 +326,22 @@ function openRaceSSE(text){
         const safeContent = sanitizeForTTS(content);
         let textToSpeak = null;
         if (data.applied && typeof data.applied === 'object' && Object.keys(data.applied).length > 0){
-          // Tool call present — ask backend summarizer to produce a short spoken summary
+          // Tool call present — ask backend summarizer to stream a concise spoken summary
           try{
             const pref = who === 'cloud' ? 'cloud' : 'local';
-            const sumResp = await fetch('/api/tts/summarize', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: safeContent, applied: data.applied, prefer: pref }) });
-            if (sumResp.ok){ const sj = await sumResp.json().catch(()=>null); if (sj && sj.summary) textToSpeak = sj.summary; }
-          }catch(e){ console.warn('summarize call failed', e); }
-          if (!textToSpeak){ textToSpeak = composeSummary(data.parsed, data.applied, safeContent); }
+            const voice = who === 'cloud' ? 'sage' : undefined;
+            const player = who === 'local' ? playerLocal : playerCloud;
+            const source = pref;
+            streamSummarizeAndPlay(safeContent, data.applied, pref, source, voice, player, promptStart, ()=>{ sawSentence = true }).catch(e=>{
+              console.warn('summarize_stream failed', e);
+              // fallback: synthesize a composed summary client-side
+              try{
+                const fallback = composeSummary(data.parsed, data.applied, safeContent);
+                streamTtsSentencesViaFetch(sanitizeForTTS(fallback), source, voice, player, promptStart).catch(()=>{});
+              }catch(err){ console.warn('fallback synth failed', err); }
+            });
+          }catch(e){ console.warn('summarize_stream error', e); try{ const fallback = composeSummary(data.parsed, data.applied, safeContent); streamTtsSentencesViaFetch(sanitizeForTTS(fallback), who === 'cloud' ? 'cloud' : 'local', who === 'cloud' ? 'sage' : undefined, who === 'local' ? playerLocal : playerCloud, promptStart).catch(()=>{}); }catch(err){}
+          }
         } else {
           // No tool call — speak the assistant content directly
           textToSpeak = safeContent;
@@ -312,17 +352,65 @@ function openRaceSSE(text){
           const safeSpeak = sanitizeForTTS(textToSpeak);
           const player = who === 'local' ? playerLocal : playerCloud;
           const source = who === 'cloud' ? 'cloud' : 'local';
-          // Use streaming consumer to play per-sentence audio as it arrives
-          try{
-            streamTtsSentencesViaFetch(safeSpeak, source, voice, player, promptStart).catch(e=>{ console.warn('streaming TTS failed', e); });
-          }catch(e){ console.warn('streamTtsSentencesViaFetch error', e); }
+          // Delay client-initiated TTS slightly. If server-side `sentence` events
+          // arrive within this window, skip the client TTS to avoid duplicate
+          // synthesis and playback.
+          (async function(){
+            const delayMs = 250;
+            await new Promise(r => setTimeout(r, delayMs));
+            if (sawSentence) return; // server is already streaming sentence audio
+            try{
+              streamTtsSentencesViaFetch(safeSpeak, source, voice, player, promptStart).catch(e=>{ console.warn('streaming TTS failed', e); });
+            }catch(e){ console.warn('streamTtsSentencesViaFetch error', e); }
+          })();
         }
       }catch(e){ console.warn('Auto TTS error', e); }
     }catch(e){
       console.error(e);
     }
   });
-  es.addEventListener('error', (e)=>{ es.close(); });
+  // Server indicates it has queued TTS work for this stream (prevents client-side TTS)
+  es.addEventListener('tts_queued', (ev) => {
+    try{
+      const obj = JSON.parse(ev.data || '{}');
+      if (obj && obj.stream_id && esStreamId && obj.stream_id === esStreamId){
+        sawSentence = true;
+      }
+    }catch(e){ console.warn('tts_queued parse error', e); }
+  });
+      // Partial streaming text updates (deltas)
+      es.addEventListener('model_text', (ev) => {
+        try{
+          const obj = JSON.parse(ev.data);
+          const who = obj.model || 'local';
+          const text = obj.text || '';
+          if (!text) return;
+          const el = ensureRespEl(who);
+          try{ el.textContent = (el.textContent || '') + text; }catch(e){}
+        }catch(e){ console.warn('model_text parse error', e); }
+      });
+
+      // Incoming synthesized sentence audio (base64) sent from server stream
+      es.addEventListener('sentence', (ev) => {
+        try{
+          const payload = JSON.parse(ev.data);
+          // if stream ids are present, only accept events matching this ES
+          if (payload.stream_id && esStreamId && payload.stream_id !== esStreamId) return;
+          // mark that server is providing sentence audio (prevents duplicate client TTS)
+          sawSentence = true;
+          const b64 = payload.audio_data || payload.audio || '';
+          if (!b64) return;
+          const who = payload.model || payload.source || 'local';
+          const binStr = atob(b64);
+          const len = binStr.length;
+          const arr = new Uint8Array(len);
+          for (let i=0;i<len;i++) arr[i] = binStr.charCodeAt(i);
+          const blob = new Blob([arr.buffer], { type: payload.mime_type || 'audio/mpeg' });
+          _enqueueAudioFor(who, blob);
+        }catch(e){ console.warn('sentence parse error', e); }
+      });
+
+      es.addEventListener('error', (e)=>{ es.close(); });
   return es;
 }
 
@@ -597,6 +685,95 @@ async function streamTtsSentencesViaFetch(text, source='local', voice=undefined,
 // Expose helper for debugging in console
 window.streamTtsSentencesViaFetch = streamTtsSentencesViaFetch;
 
+// Stream summarizer (LLM) and server-side per-sentence TTS, play as sentences arrive
+async function streamSummarizeAndPlay(text, applied, prefer='cloud', who='local', voice=undefined, playerEl=null, ttfaStart=null, onFirstSentence=null){
+  const payload = { text };
+  if (typeof applied !== 'undefined') payload.applied = applied;
+  if (prefer) payload.prefer = prefer;
+
+  const res = await fetch('/api/tts/summarize_stream', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) {
+    const j = await res.json().catch(()=>null);
+    throw new Error((j && j.error) ? j.error : res.statusText);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buf = '';
+  let firstSentReceived = false;
+
+  const parseSSEChunk = (chunk) => {
+    const parts = chunk.split('\n\n');
+    for (let i=0;i<parts.length-1;i++){
+      const block = parts[i].trim();
+      if (!block) continue;
+      const lines = block.split('\n');
+      let evt = 'message';
+      let data = '';
+      for (const L of lines){
+        if (L.startsWith('event:')) evt = L.replace(/^event:\s*/,'').trim();
+        else if (L.startsWith('data:')) data += L.replace(/^data:\s*/,'') + '\n';
+      }
+      data = data.trim();
+      handleSSEEvent(evt, data);
+    }
+    return parts[parts.length-1];
+  };
+
+  const handleSSEEvent = (evt, data) => {
+    try{
+      if (evt === 'sentence'){
+        const payload = JSON.parse(data);
+        const b64 = payload.audio_data || payload.audio || '';
+        if (!b64) return;
+        const binStr = atob(b64);
+        const len = binStr.length;
+        const arr = new Uint8Array(len);
+        for (let i=0;i<len;i++) arr[i] = binStr.charCodeAt(i);
+        const blob = new Blob([arr.buffer], { type: payload.mime_type || 'audio/mpeg' });
+        // signal caller that server is providing audio
+        if (!firstSentReceived){
+          firstSentReceived = true;
+          try{ if (ttfaStart) { const ms = Date.now() - Number(ttfaStart); _metricsSet(who, 'ttfa', ms); } }catch(e){}
+          try{ if (onFirstSentence) onFirstSentence(); }catch(e){}
+        }
+        _enqueueAudioFor(who, blob);
+      } else if (evt === 'model_text'){
+        try{
+          const obj = JSON.parse(data);
+          const text = obj.text || '';
+          if (!text) return;
+          const el = ensureRespEl(who);
+          try{ el.textContent = (el.textContent || '') + text; }catch(e){}
+        }catch(e){ console.warn('model_text parse error (summarize_stream)', e); }
+      } else if (evt === 'tts_queued'){
+        try{ if (onFirstSentence) onFirstSentence(); }catch(e){}
+      } else if (evt === 'final_audio'){
+        // ignore here; streamSentences handler will otherwise surface final audio
+      } else if (evt === 'final_audio_bytes'){
+        // ignore
+      } else if (evt === 'app_error'){
+        try{ const e = JSON.parse(data); console.warn('summarize_stream error', e); }catch(e){ console.warn('summarize_stream error', data); }
+      }
+    }catch(e){ console.error('handleSSEEvent summarize_stream', e); }
+  };
+
+  try{
+    while(true){
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      buf = parseSSEChunk(buf);
+    }
+    if (buf && buf.trim()) parseSSEChunk(buf + '\n\n');
+  }catch(e){ console.warn('streamSummarizeAndPlay read error', e); }
+}
+
+
 
 
 // Sanitize assistant content before sending to summarizer or TTS
@@ -667,13 +844,20 @@ function composeSummary(parsed, applied, content){
         const dev = (applied.device === 'light' || applied.device === 'blinds') ? 'light' : applied.device;
         const act = applied.action || '';
         if (applied.bulk && Array.isArray(applied.applied)){
-          const rooms = applied.applied.map(r=> (r.room ? titleCase(r.room) : '')).filter(Boolean);
-          if (rooms.length === 1) return `Done — I've ${verbMap[act] || act} the ${dev} in ${rooms[0]}.`;
-          if (rooms.length > 1) return `Done — I've ${verbMap[act] || act} the ${dev} in ${rooms.slice(0,3).join(', ')}.`;
-          return `Done — I've ${verbMap[act] || act} the ${dev} for you.`;
+            // if any target is 'all', prefer a concise 'all rooms' phrasing
+            const rawRooms = applied.applied.map(r => (r.room || '').toString().toLowerCase());
+            if (rawRooms.includes('all')){
+              return `Done — I've ${verbMap[act] || act} the ${dev} in all rooms.`;
+            }
+            const rooms = applied.applied.map(r=> (r.room ? ('the ' + titleCase(r.room)) : '')).filter(Boolean);
+            if (rooms.length === 1) return `Done — I've ${verbMap[act] || act} the ${dev} in ${rooms[0]}.`;
+            if (rooms.length > 1) return `Done — I've ${verbMap[act] || act} the ${dev} in ${rooms.slice(0,3).join(', ')}.`;
+            return `Done — I've ${verbMap[act] || act} the ${dev} for you.`;
         }
         if (applied.room){
-          return `Done — I've ${verbMap[applied.action] || (applied.action || '').replace(/_/g,' ')} the ${dev} in ${titleCase(applied.room)}.`;
+          const rn = (applied.room || '').toString().toLowerCase();
+          if (rn === 'all') return `Done — I've ${verbMap[applied.action] || (applied.action || '').replace(/_/g,' ')} the ${dev} in all rooms.`;
+          return `Done — I've ${verbMap[applied.action] || (applied.action || '').replace(/_/g,' ')} the ${dev} in the ${titleCase(applied.room)}.`;
         }
         // fallback
         return `Done — I've ${verbMap[applied.action] || (applied.action || '').replace(/_/g,' ')} the ${dev}.`;
@@ -790,19 +974,13 @@ recStartBtn.addEventListener('click', async ()=>{
                   // Auto-TTS: only summarize when a tool call was performed; otherwise speak LLM content directly
                   try{
                     const safeText = sanitizeForTTS(c);
-                    let textToSpeak = null;
-                    if (localModelResult.applied && typeof localModelResult.applied === 'object' && Object.keys(localModelResult.applied).length > 0){
-                      try{
-                        const sumResp = await fetch('/api/tts/summarize', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: safeText, applied: localModelResult.applied, prefer: 'local', user_prompt: localText }) });
-                        if (sumResp.ok){ const sj = await sumResp.json().catch(()=>null); if (sj && sj.summary) textToSpeak = sj.summary; }
-                      }catch(e){ console.warn('local summarize failed', e); }
-                      if (!textToSpeak) textToSpeak = composeSummary(localModelResult.parsed, localModelResult.applied, safeText);
-                    } else {
-                      textToSpeak = safeText;
-                    }
-                    if (textToSpeak){
-                      const safe = sanitizeForTTS(textToSpeak);
-                      try{ streamTtsSentencesViaFetch(safe, 'local', undefined, playerLocal, startTs).catch(()=>{}); }catch(e){ console.warn('streaming local TTS failed', e); }
+                    // stream summarizer + server-side TTS; fallback to client-side compose+stream
+                    try{
+                      streamSummarizeAndPlay(safeText, localModelResult.applied, 'local', 'local', undefined, playerLocal, startTs).catch(e=>{
+                        console.warn('local summarize_stream failed', e);
+                        try{ const fb = composeSummary(localModelResult.parsed, localModelResult.applied, safeText); streamTtsSentencesViaFetch(sanitizeForTTS(fb), 'local', undefined, playerLocal, startTs).catch(()=>{}); }catch(err){ console.warn('fallback synth failed', err); }
+                      });
+                    }catch(e){ console.warn('local summarize_stream error', e); try{ const fb = composeSummary(localModelResult.parsed, localModelResult.applied, safeText); streamTtsSentencesViaFetch(sanitizeForTTS(fb), 'local', undefined, playerLocal, startTs).catch(()=>{}); }catch(err){}
                     }
                   }catch(e){ console.warn('local auto-TTS failed', e); }
             }catch(e){ localPanel.textContent = `Local LLM error: ${e}`; }
@@ -837,19 +1015,12 @@ recStartBtn.addEventListener('click', async ()=>{
                   // Auto-TTS: only summarize when a tool call was performed; otherwise speak LLM content directly
                   try{
                     const safeText = sanitizeForTTS(c2);
-                    let textToSpeak = null;
-                    if (cloudModelResult.applied && typeof cloudModelResult.applied === 'object' && Object.keys(cloudModelResult.applied).length > 0){
-                      try{
-                        const sumResp = await fetch('/api/tts/summarize', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: safeText, applied: cloudModelResult.applied, prefer: 'cloud', user_prompt: cloudText }) });
-                        if (sumResp.ok){ const sj = await sumResp.json().catch(()=>null); if (sj && sj.summary) textToSpeak = sj.summary; }
-                      }catch(e){ console.warn('cloud summarize failed', e); }
-                      if (!textToSpeak) textToSpeak = composeSummary(cloudModelResult.parsed, cloudModelResult.applied, safeText);
-                    } else {
-                      textToSpeak = safeText;
-                    }
-                    if (textToSpeak){
-                      const safe = sanitizeForTTS(textToSpeak);
-                      try{ streamTtsSentencesViaFetch(safe, 'cloud', 'sage', playerCloud, startTs).catch(()=>{}); }catch(e){ console.warn('streaming cloud TTS failed', e); }
+                    try{
+                      streamSummarizeAndPlay(safeText, cloudModelResult.applied, 'cloud', 'cloud', 'sage', playerCloud, startTs).catch(e=>{
+                        console.warn('cloud summarize_stream failed', e);
+                        try{ const fb = composeSummary(cloudModelResult.parsed, cloudModelResult.applied, safeText); streamTtsSentencesViaFetch(sanitizeForTTS(fb), 'cloud', 'sage', playerCloud, startTs).catch(()=>{}); }catch(err){ console.warn('fallback synth failed', err); }
+                      });
+                    }catch(e){ console.warn('cloud summarize_stream error', e); try{ const fb = composeSummary(cloudModelResult.parsed, cloudModelResult.applied, safeText); streamTtsSentencesViaFetch(sanitizeForTTS(fb), 'cloud', 'sage', playerCloud, startTs).catch(()=>{}); }catch(err){}
                     }
                   }catch(e){ console.warn('cloud auto-TTS failed', e); }
             }catch(e){ cloudPanel.textContent = `Cloud LLM error: ${e}`; }

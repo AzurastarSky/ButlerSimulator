@@ -1,6 +1,7 @@
 from flask import Flask, send_from_directory, request, jsonify, Response, stream_with_context
 from pathlib import Path
 import os, time, base64, uuid, queue, threading, requests, concurrent.futures, json
+from typing import List
 
 # Prefer package-style relative imports, but allow running `python web.py`
 try:
@@ -179,141 +180,399 @@ def api_chat_stream():
     history = [{'role': 'user', 'content': user}] if user else []
 
     def generate():
+        # Stream tokens from both models concurrently and process deltas as they arrive.
         start = time.time()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-            futures = {}
-            if getattr(llm_api, 'local_llm', None):
-                futures[ex.submit(llm_api.local_llm.post_chat, history)] = 'local'
-            if getattr(llm_api, 'OPENAI_KEY', None):
-                futures[ex.submit(llm_api.post_chat_openai, history)] = 'cloud'
+        stream_id = uuid.uuid4().hex
+        q = queue.Queue()
+        done = {'local': False, 'cloud': False}
 
-            for fut in concurrent.futures.as_completed(futures):
-                who = futures[fut]
-                t = int((time.time() - start) * 1000)
-                try:
-                    resp = fut.result()
-                except Exception as e:
-                    payload = {'model': who, 'ok': False, 'error': str(e), 'ms': t}
-                    yield f"event: model\ndata: {json.dumps(payload)}\n\n"
+        def stream_worker_local():
+            who = 'local'
+            try:
+                if not getattr(llm_api, 'local_llm', None):
+                    q.put({'who': who, 'type': 'error', 'error': 'no local LLM configured'})
+                    done[who] = True
+                    return
+                # build messages similar to other endpoints
+                sys_prompt = llm_api.local_llm.SYSTEM_PROMPT if hasattr(llm_api.local_llm, 'SYSTEM_PROMPT') else ''
+                msgs = [{'role': 'system', 'content': sys_prompt}] + (history[-getattr(llm_api.local_llm, 'MAX_HISTORY', 8):] if history else [])
+                payload = {'model': getattr(llm_api.local_llm, 'MODEL', None) or 'local', 'messages': msgs, 'stream': True, 'temperature': 0}
+                url = getattr(llm_api.local_llm, 'LLM_SERVER_URL', None)
+                if not url:
+                    q.put({'who': who, 'type': 'error', 'error': 'local LLM URL not configured'})
+                    done[who] = True
+                    return
+                resp = requests.post(url, json=payload, timeout=(5, 60), stream=True)
+                buffer = ''
+                accumulated = ''
+                t0 = time.time()
+                for line in resp.iter_lines(decode_unicode=True):
+                    if line is None:
+                        continue
+                    s = line.strip()
+                    if not s:
+                        continue
+                    # Attempt to extract JSON from standard 'data: {...}' lines
+                    if s.startswith('data:'):
+                        s = s[len('data:'):].strip()
+                    if s == '[DONE]':
+                        break
+                    try:
+                        obj = json.loads(s)
+                    except Exception:
+                        continue
+                    # OpenAI-like shape: choices[].delta.content
+                    try:
+                        delta = obj.get('choices', [])[0].get('delta', {}).get('content', '')
+                    except Exception:
+                        delta = ''
+                    if not delta:
+                        continue
+                    accumulated += str(delta)
+                    q.put({'who': who, 'type': 'delta', 'text': delta, 'ts': int((time.time()-start)*1000), 'stream_id': stream_id})
+                # final full content attempt
+                q.put({'who': who, 'type': 'done', 'content': accumulated, 'ms': int((time.time()-start)*1000)})
+            except Exception as e:
+                q.put({'who': who, 'type': 'error', 'error': str(e)})
+            finally:
+                done['local'] = True
+
+        def stream_worker_cloud():
+            who = 'cloud'
+            try:
+                if not getattr(llm_api, 'OPENAI_KEY', None):
+                    q.put({'who': who, 'type': 'error', 'error': 'OPENAI_API_KEY not set'})
+                    done[who] = True
+                    return
+                # construct messages using llm_api logic
+                sys_prompt = llm_api.llm_helper.SYSTEM_PROMPT if getattr(llm_api, 'llm_helper', None) and hasattr(llm_api.llm_helper, 'SYSTEM_PROMPT') else (llm_api.local_llm.SYSTEM_PROMPT if getattr(llm_api, 'local_llm', None) and hasattr(llm_api.local_llm, 'SYSTEM_PROMPT') else '')
+                msgs = [{'role': 'system', 'content': sys_prompt}] + (history[-(llm_api.llm_helper.MAX_HISTORY if getattr(llm_api, 'llm_helper', None) and hasattr(llm_api.llm_helper, 'MAX_HISTORY') else (llm_api.local_llm.MAX_HISTORY if getattr(llm_api, 'local_llm', None) and hasattr(llm_api.local_llm, 'MAX_HISTORY') else 8)):] if history else [])
+                payload = {'model': 'gpt-5.2', 'messages': msgs, 'temperature': 0, 'stream': True}
+                headers = {'Authorization': f'Bearer {llm_api.OPENAI_KEY}', 'Content-Type': 'application/json'}
+                resp = requests.post(llm_api.OPENAI_URL, json=payload, headers=headers, timeout=(5, 60), stream=True)
+                accumulated = ''
+                for line in resp.iter_lines(decode_unicode=True):
+                    if line is None:
+                        continue
+                    s = line.strip()
+                    if not s:
+                        continue
+                    if s.startswith('data:'):
+                        s = s[len('data:'):].strip()
+                    if s == '[DONE]':
+                        break
+                    try:
+                        obj = json.loads(s)
+                    except Exception:
+                        continue
+                    try:
+                        delta = obj.get('choices', [])[0].get('delta', {}).get('content', '')
+                    except Exception:
+                        delta = ''
+                    if not delta:
+                        continue
+                    accumulated += str(delta)
+                    q.put({'who': who, 'type': 'delta', 'text': delta, 'ts': int((time.time()-start)*1000), 'stream_id': stream_id})
+                q.put({'who': who, 'type': 'done', 'content': accumulated, 'ms': int((time.time()-start)*1000)})
+            except Exception as e:
+                q.put({'who': who, 'type': 'error', 'error': str(e)})
+            finally:
+                done['cloud'] = True
+
+        # start both workers simultaneously (if configured)
+        threads = []
+        t_local = threading.Thread(target=stream_worker_local, daemon=True)
+        t_cloud = threading.Thread(target=stream_worker_cloud, daemon=True)
+        threads.append(t_local)
+        threads.append(t_cloud)
+        t_local.start()
+        t_cloud.start()
+
+        # buffers per model to accumulate until punctuation
+        buffers = {'local': '', 'cloud': ''}
+        run_ids = {'local': None, 'cloud': None}
+        # toolcall collection state per model (bracket-aware, handles strings/escapes)
+        tool_state = {
+            'local': {'collecting': False, 'buffer': '', 'depth': 0, 'in_string': False, 'escape': False},
+            'cloud': {'collecting': False, 'buffer': '', 'depth': 0, 'in_string': False, 'escape': False}
+        }
+        # executor for background TTS synthesis so we don't block token consumption
+        synth_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        pending_futures: List[concurrent.futures.Future] = []
+        synth_lock = threading.Lock()
+        # per-who monotonic chunk counters to ensure indices increase
+        chunk_counters = {'local': 0, 'cloud': 0}
+        # expected next index to emit per who, and pending storage for out-of-order results
+        expected_idx = {'local': 0, 'cloud': 0}
+        pending_sentences = {'local': {}, 'cloud': {}}
+
+        def _process_toolcall_chunk(who, delta_text):
+            """Process an incoming token delta for potential toolcall JSON.
+            Returns the text that should be spoken (delta with toolcall JSON removed).
+            If a complete JSON toolcall is found, schedules apply_toolcall in background
+            and enqueues a 'tool_result' item into the main queue when ready.
+            """
+            out_chars = []
+            st = tool_state.get(who)
+            # iterate characters to correctly track strings/escapes and brace depth
+            i = 0
+            L = len(delta_text)
+            while i < L:
+                ch = delta_text[i]
+                if not st['collecting']:
+                    if ch == '{':
+                        # start collecting
+                        st['collecting'] = True
+                        st['buffer'] = ch
+                        st['depth'] = 1
+                        st['in_string'] = False
+                        st['escape'] = False
+                    else:
+                        out_chars.append(ch)
+                else:
+                    st['buffer'] += ch
+                    # handle escape within string
+                    if st['in_string']:
+                        if st['escape']:
+                            st['escape'] = False
+                        elif ch == '\\':
+                            st['escape'] = True
+                        elif ch == '"':
+                            st['in_string'] = False
+                    else:
+                        if ch == '"':
+                            st['in_string'] = True
+                        elif ch == '{':
+                            st['depth'] += 1
+                        elif ch == '}':
+                            st['depth'] -= 1
+                            if st['depth'] <= 0:
+                                # complete JSON candidate
+                                candidate = st['buffer']
+                                # reset state before scheduling to avoid reentrancy
+                                st['collecting'] = False
+                                st['buffer'] = ''
+                                st['depth'] = 0
+                                st['in_string'] = False
+                                st['escape'] = False
+                                # try to parse JSON
+                                parsed = None
+                                try:
+                                    parsed = json.loads(candidate)
+                                except Exception:
+                                    parsed = None
+                                if isinstance(parsed, dict) and parsed.get('tool'):
+                                    # schedule apply_toolcall in background thread
+                                    def _apply_and_enqueue(parsed_obj, target_who, sid):
+                                        try:
+                                            t0 = time.time()
+                                            last_text = history[-1]['content'] if history else (user or '')
+                                            res = llm_api.apply_toolcall(parsed_obj, target=target_who, last_user_text=last_text)
+                                            t1 = time.time()
+                                            q.put({'who': target_who, 'type': 'tool_result', 'result': res, 'parsed': parsed_obj, 'ms': int((t1-t0)*1000), 'stream_id': sid})
+                                        except Exception as e:
+                                            try:
+                                                q.put({'who': target_who, 'type': 'tool_result', 'result': {'ok': False, 'error': str(e)}, 'parsed': parsed_obj, 'ms': 0, 'stream_id': sid})
+                                            except Exception:
+                                                pass
+                                    thr = threading.Thread(target=_apply_and_enqueue, args=(parsed, who, stream_id), daemon=True)
+                                    thr.start()
+                                else:
+                                    # not valid toolcall JSON — treat candidate as spoken text
+                                    out_chars.append(candidate)
+                    # end collecting branch
+                i += 1
+            return ''.join(out_chars)
+
+        # consume queued token deltas and emit SSE events; finish when both done
+        while True:
+            try:
+                item = q.get(timeout=30)
+            except Exception:
+                # if both workers finished, queue empty, and no pending synths, break
+                with synth_lock:
+                    no_pending = (len(pending_futures) == 0)
+                if done.get('local') and done.get('cloud') and q.empty() and no_pending:
+                    break
+                else:
+                    yield ': ping\n\n'
                     continue
 
-                try:
-                    if who == 'local' and getattr(llm_api, 'local_llm', None):
-                        content = llm_api.local_llm.get_message_content(resp)
-                    elif getattr(llm_api, 'llm_helper', None):
-                        content = llm_api.llm_helper.get_message_content(resp)
-                    else:
-                        content = resp.get('choices', [])[0].get('message', {}).get('content', '')
-                except Exception:
-                    content = ''
+            who = item.get('who')
 
-                parsed = None
-                applied = None
-                try:
-                    if who == 'local' and getattr(llm_api, 'local_llm', None) and hasattr(llm_api.local_llm, 'extract_json'):
-                        parsed = llm_api.local_llm.extract_json(content)
-                    elif getattr(llm_api, 'llm_helper', None) and hasattr(llm_api.llm_helper, 'extract_json'):
-                        parsed = llm_api.llm_helper.extract_json(content)
-                except Exception:
-                    parsed = None
+            if item.get('type') == 'error':
+                payload = {'model': who, 'ok': False, 'error': item.get('error'), 'ms': int((time.time()-start)*1000), 'stream_id': item.get('stream_id') or stream_id}
+                yield f"event: model\ndata: {json.dumps(payload)}\n\n"
+                continue
 
-                if parsed:
-                    last_text = history[-1]['content'] if history else (user or '')
-                    applied = llm_api.apply_toolcall(parsed, target=who, last_user_text=last_text)
+            if item.get('type') == 'delta':
+                # emit original model_text fragment for backwards compatibility
+                delta = str(item.get('text') or '')
+                try:
+                    yield f"event: model_text\ndata: {json.dumps({'model': who, 'index': None, 'text': delta, 'ms': item.get('ts'), 'stream_id': item.get('stream_id') or stream_id})}\n\n"
+                except Exception:
+                    pass
+                # process delta for toolcall JSON and append spoken text only
+                try:
+                    speak_delta = _process_toolcall_chunk(who, delta)
+                except Exception:
+                    speak_delta = delta
+                if speak_delta:
+                    buffers[who] += speak_delta
+                # check for sentences in buffer
+                sentences, remainder = tts._extract_sentences(buffers[who])
+                if sentences:
+                    for s_idx, sent in enumerate(sentences):
+                        run_id = run_ids.get(who) or (uuid.uuid4().hex)
+                        run_ids[who] = run_id
+                        # allocate a monotonic index for this chunk
+                        idx = chunk_counters.get(who, 0)
+                        chunk_counters[who] = idx + 1
+
+                        def _synth_and_save(s=sent, w=who, rid=run_id, idx=idx, sid=stream_id):
+                            tts_start = time.perf_counter()
+                            if w == 'cloud':
+                                if not tts.cloud_tts_provider:
+                                    raise RuntimeError('cloud TTS provider not configured')
+                                audio = tts.cloud_tts_provider.synthesize_speech(s, None)
+                                src = 'cloud'
+                            else:
+                                if not tts.local_tts_provider:
+                                    raise RuntimeError('local TTS provider not configured')
+                                audio = tts.local_tts_provider.synthesize_speech(s, None)
+                                src = 'local'
+                            tts_end = time.perf_counter()
+                            tts_ms = (tts_end - tts_start) * 1000.0
+                            try:
+                                path = tts._save_chunk_audio(rid, idx, src, audio)
+                                with tts._TTS_JOB_LOCK:
+                                    job = tts.JOBS.get(rid) or {}
+                                    job.setdefault('chunks', []).append(path)
+                                    tts.JOBS[rid] = job
+                            except Exception:
+                                pass
+                            return {'who': w, 'run_id': rid, 'index': idx, 'audio': bytes(audio), 'source': src, 'tts_ms': tts_ms, 'text': s, 'stream_id': sid}
+
+                        # submit synthesis to background executor so we keep consuming tokens
+                        fut = synth_executor.submit(_synth_and_save)
+                        # attach callback to push completed synth results into the central queue
+                        def _on_done(futobj, w=who):
+                            try:
+                                res = None
+                                try:
+                                    res = futobj.result()
+                                except Exception as e:
+                                    q.put({'who': w, 'type': 'synth_error', 'error': str(e), 'stream_id': stream_id})
+                                    return
+                                if res:
+                                    # remove from pending list
+                                    try:
+                                        with synth_lock:
+                                            try:
+                                                pending_futures.remove(futobj)
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
+                                    q.put({'who': w, 'type': 'synth', 'res': res, 'stream_id': stream_id})
+                            except Exception:
+                                try:
+                                    q.put({'who': w, 'type': 'synth_error', 'error': 'synth callback error', 'stream_id': stream_id})
+                                except Exception:
+                                    pass
+
+                        fut.add_done_callback(_on_done)
+                        with synth_lock:
+                            pending_futures.append(fut)
+                        # notify clients that a TTS task was queued for this stream
+                        try:
+                            yield f"event: tts_queued\ndata: {json.dumps({'model': who, 'stream_id': stream_id, 'index': idx})}\n\n"
+                        except Exception:
+                            pass
+                    buffers[who] = remainder
+
+            # synth completions are pushed into the queue by future callbacks
+            # handle completed synth items (sent by _on_done)
+            if item.get('type') == 'synth':
+                try:
+                    res = item.get('res') or {}
+                    who = item.get('who') or res.get('who')
+                    idx = res.get('index')
+                    if who is None or idx is None:
+                        # fallback to immediate emit if metadata missing
+                        if res and res.get('audio'):
+                            try:
+                                audio_b64 = base64.b64encode(res.get('audio')).decode('utf-8')
+                                yield f"event: sentence\ndata: {json.dumps({'index': res.get('index'), 'audio_data': audio_b64, 'mime_type': 'audio/mpeg', 'text': res.get('text'), 'model': res.get('who'), 'source': res.get('source'), 'tts_ms': res.get('tts_ms'), 'stream_id': res.get('stream_id') or stream_id})}\n\n"
+                            except Exception:
+                                pass
+                        continue
+                    # store result and attempt in-order emission
+                    pending_sentences.setdefault(who, {})[idx] = res
+                    # emit while next expected is available
+                    while True:
+                        nex = expected_idx.get(who, 0)
+                        if nex in pending_sentences.get(who, {}):
+                            r = pending_sentences[who].pop(nex)
+                            try:
+                                audio_b64 = base64.b64encode(r.get('audio')).decode('utf-8')
+                                yield f"event: sentence\ndata: {json.dumps({'index': r.get('index'), 'audio_data': audio_b64, 'mime_type': 'audio/mpeg', 'text': r.get('text'), 'model': r.get('who'), 'source': r.get('source'), 'tts_ms': r.get('tts_ms'), 'stream_id': r.get('stream_id') or stream_id})}\n\n"
+                            except Exception:
+                                pass
+                            expected_idx[who] = nex + 1
+                            continue
+                        break
+                except Exception:
                     try:
+                        yield f"event: app_error\ndata: {json.dumps({'message': 'TTS task failed', 'error': str(item.get('error') or '')})}\n\n"
+                    except Exception:
+                        pass
+                continue
+            if item.get('type') == 'synth_error':
+                try:
+                    yield f"event: app_error\ndata: {json.dumps({'message': 'TTS synth error', 'error': item.get('error'), 'stream_id': item.get('stream_id')})}\n\n"
+                except Exception:
+                    pass
+                continue
+
+            if item.get('type') == 'tool_result':
+                try:
+                    who = item.get('who')
+                    res = item.get('result') or {}
+                    parsed = item.get('parsed')
+                    payload = {'model': who, 'ok': bool(res.get('ok', True)), 'content': None, 'parsed': parsed, 'applied': res, 'ms': item.get('ms'), 'stream_id': item.get('stream_id')}
+                    yield f"event: model\ndata: {json.dumps(payload, default=str)}\n\n"
+                    try:
+                        # if tool changed state, publish state event
                         state.publish_state_event()
                     except Exception:
                         pass
+                except Exception:
+                    try:
+                        yield f"event: app_error\ndata: {json.dumps({'message': 'Tool result handling failed'})}\n\n"
+                    except Exception:
+                        pass
+                continue
 
-                # Emit the original model event (backwards-compatible) and then
-                # stream the assistant text sentence-by-sentence, synthesizing each
-                # sentence to audio on-the-fly, emitting SSE events for both text
-                # and audio chunks. This preserves the existing sentence-chunking
-                # behavior used by /api/tts/stream_sentences while also streaming
-                # the assistant text for faster TTFA.
-                payload = {'model': who, 'ok': True, 'content': content, 'parsed': parsed, 'applied': applied, 'ms': t}
+            if item.get('type') == 'done':
+                # final model event with full content
+                payload = {'model': who, 'ok': True, 'content': item.get('content'), 'parsed': None, 'applied': None, 'ms': item.get('ms'), 'stream_id': item.get('stream_id') or stream_id}
                 try:
                     yield f"event: model\ndata: {json.dumps(payload, default=str)}\n\n"
                 except Exception:
                     pass
 
-                run_id = uuid.uuid4().hex
-                tts._purge_old_job_files(except_job_id=run_id)
-                sentences, remainder = tts._extract_sentences(content)
-                if remainder.strip():
-                    sentences.append(remainder.strip())
+        # ensure workers have finished and clean up executor
+        try:
+            synth_executor.shutdown(wait=False)
+        except Exception:
+            pass
 
-                parts = []
-                for idx, sentence in enumerate(sentences):
-                    # emit text fragment first for low-latency display
-                    try:
-                        yield f"event: model_text\ndata: {json.dumps({'model': who, 'index': idx, 'text': sentence, 'ms': t})}\n\n"
-                    except Exception:
-                        pass
-
-
-                    # synthesize audio for the sentence using the exact provider
-                    # matching the model (no cross-provider fallback allowed).
-                    a0 = time.perf_counter()
-                    audio_bytes = None
-                    source = None
-                    try:
-                        if who == 'cloud':
-                            if not tts.cloud_tts_provider:
-                                raise RuntimeError('cloud TTS provider not configured')
-                            audio_bytes = tts.cloud_tts_provider.synthesize_speech(sentence, None)
-                            source = 'cloud'
-                        elif who == 'local':
-                            if not tts.local_tts_provider:
-                                raise RuntimeError('local TTS provider not configured')
-                            audio_bytes = tts.local_tts_provider.synthesize_speech(sentence, None)
-                            source = 'local'
-                        else:
-                            raise RuntimeError(f'unknown model source: {who}')
-                        a1 = time.perf_counter()
-                    except Exception as e:
-                        a1 = time.perf_counter()
-                        audio_bytes = None
-                        yield f"event: app_error\ndata: {json.dumps({'message': f'TTS failed for sentence {idx}: {repr(e)}', 'model': who})}\n\n"
-                        continue
-
-                    parts.append(bytes(audio_bytes))
-                    try:
-                        # Use the actual provider source when saving chunk files
-                        chunk_src = source
-                        chunk_path = tts._save_chunk_audio(run_id, idx, chunk_src, audio_bytes)
-                        with tts._TTS_JOB_LOCK:
-                            job = tts.JOBS.get(run_id) or {}
-                            job.setdefault('chunks', []).append(chunk_path)
-                            tts.JOBS[run_id] = job
-                    except Exception:
-                        pass
-
-                    try:
-                        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
-                        yield f"event: sentence\ndata: {json.dumps({'index': idx, 'audio_data': audio_b64, 'mime_type': 'audio/mpeg', 'text': sentence, 'tts_ms': (a1-a0)*1000.0, 'model': who, 'source': source})}\n\n"
-                    except Exception:
-                        pass
-
-                # persist combined audio for later retrieval
-                try:
-                    full = b''.join(parts)
-                    with tts._TTS_JOB_LOCK:
-                        tts.JOBS[run_id] = {'text': content, 'created_at': time.time()}
-                    save_path = tts._save_job_audio(run_id, who, full)
-                    with tts._TTS_JOB_LOCK:
-                        tts.JOBS[run_id][f"{who}_path"] = save_path
-                        tts.JOBS[run_id][f"{who}_bytes"] = full
-                        tts.JOBS[run_id][who] = full
-                        tts.JOBS[run_id]['status'] = {who: 'done'}
-                    yield f"event: final_audio\ndata: {json.dumps({'url': f'/api/tts/file/{run_id}?source={who}'})}\n\n"
-                    try:
-                        audio_b64_full = base64.b64encode(full).decode('utf-8')
-                        yield f"event: final_audio_bytes\ndata: {json.dumps({'audio_data': audio_b64_full, 'mime_type': 'audio/mpeg', 'model': who})}\n\n"
-                    except Exception:
-                        pass
-                except Exception:
-                    yield f"event: app_error\ndata: {json.dumps({'message': 'Failed to persist final audio'})}\n\n"
+        for t in threads:
+            try:
+                t.join(timeout=0.1)
+            except Exception:
+                pass
 
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
@@ -345,9 +604,56 @@ def api_tts_summarize():
     if not safe_text:
         return jsonify({'ok': True, 'summary': ''})
 
+    # Heuristic: if the apply result indicates many rooms had their lights toggled,
+    # prefer a concise, spoken summary rather than asking the LLM to rewrite.
+    try:
+        app_obj = applied
+        if isinstance(applied, str):
+            try:
+                app_obj = json.loads(applied)
+            except Exception:
+                app_obj = applied
+        if isinstance(app_obj, list) and len(app_obj) >= 3:
+            # collect new_state values and detect whether this was a light action
+            new_states = set()
+            is_light_action = 'light' in safe_text.lower()
+            for it in app_obj:
+                if not isinstance(it, dict):
+                    continue
+                if not is_light_action:
+                    # some apply entries may include device hints
+                    dev = it.get('device') or it.get('device_type') or ''
+                    if dev and 'light' in str(dev).lower():
+                        is_light_action = True
+                ns = it.get('new_state') or it.get('state') or it.get('status')
+                if ns is not None:
+                    try:
+                        new_states.add(str(ns).lower())
+                    except Exception:
+                        pass
+            if is_light_action and len(new_states) == 1 and list(new_states)[0] in ('on', 'off'):
+                verb = 'turned on' if list(new_states)[0] == 'on' else 'turned off'
+                return jsonify({'ok': True, 'summary': f'I have {verb} all the lights'})
+    except Exception:
+        pass
+
     system_msg = (
         "You are a concise assistant that rewrites an assistant's output into a single natural, "
-        "spoken-English sentence suitable for playback by a TTS system. Keep it under 20 words."
+        "spoken-English sentence suitable for playback by a TTS system. Keep it under 20 words.\n\n"
+        "Return only the spoken sentence (no quotes or extra commentary).\n\n"
+        "Examples:\n"
+        "Assistant content: Done — I've turned on the light in the Living Room, the Dining Room, the Kitchen.\n"
+        "Applied: [{\"room\":\"living room\",\"new_state\":\"on\"},{\"room\":\"dining room\",\"new_state\":\"on\"},{\"room\":\"kitchen\",\"new_state\":\"on\"}]\n"
+        "Spoken summary: I have turned on the lights in the living room, dining room, and kitchen.\n\n"
+        "Assistant content: Done — I've turned on the light in the Living Room, the Dining Room, the Kitchen, the Bathroom, the Bedroom, and the Office.\n"
+        "Applied: [{\"room\":\"living room\",\"new_state\":\"on\"},{\"room\":\"dining room\",\"new_state\":\"on\"},{\"room\":\"kitchen\",\"new_state\":\"on\"},{\"room\":\"bathroom\",\"new_state\":\"on\"},{\"room\":\"bedroom\",\"new_state\":\"on\"},{\"room\":\"office\",\"new_state\":\"on\"}]\n"
+        "Spoken summary: I have turned on all the lights.\n\n"
+        "Assistant content: Done — I've turned on the living room light.\n"
+        "Applied: {\"room\":\"living room\",\"new_state\":\"on\"}\n"
+        "Spoken summary: I have turned on the living room light.\n\n"
+        "Rules: If 'applied' includes 'all' or 4+ rooms, say 'I have turned on all the lights'.\n"
+        "When listing rooms, use 'the' before room names and list up to three rooms, joining with commas and 'and'.\n"
+        "Keep output short and directly suitable for TTS."
     )
     user_msg = f"Assistant content: {safe_text}\nApplied: {json.dumps(applied, default=str)}"
 
@@ -396,6 +702,335 @@ def api_tts_summarize():
         summary = 'Okay — I performed the requested action.'
 
     return jsonify({'ok': True, 'summary': summary})
+
+
+@app.route('/api/tts/summarize_stream', methods=['POST'])
+def api_tts_summarize_stream():
+    try:
+        body = request.get_json(force=True) or {}
+    except Exception:
+        body = {}
+    text = body.get('text', '')
+    applied = body.get('applied')
+    prefer = (body.get('prefer') or '').lower()
+    try:
+        print(f"[summarize_stream] entry prefer={prefer} text_len={len(str(text))} applied_type={type(applied)} OPENAI_KEY_set={bool(getattr(llm_api, 'OPENAI_KEY', None))} local_llm={bool(getattr(llm_api, 'local_llm', None))}", flush=True)
+    except Exception:
+        pass
+
+    def _sanitize(s: str) -> str:
+        if not s:
+            return ''
+        try:
+            j = json.loads(s)
+            if isinstance(j, dict):
+                for k in ('reply', 'content', 'text', 'message'):
+                    if k in j and j.get(k):
+                        return str(j.get(k)).strip()
+                vals = [str(v).strip() for v in j.values() if isinstance(v, str) and v.strip()]
+                if vals:
+                    return ' '.join(vals)
+        except Exception:
+            pass
+        return ' '.join(str(s).split())
+
+    safe_text = _sanitize(text)
+    # If there's no assistant text but an apply result is provided, allow
+    # the LLM to summarize based on the `applied` data. Only return early
+    # when both text and applied are empty.
+    if not safe_text and not applied:
+        def _empty():
+            yield "event: done\ndata: {}\n\n"
+        return Response(stream_with_context(_empty()), mimetype='text/event-stream')
+
+    # (No fast-path): proceed to streaming LLM summarization below
+
+    system_msg = (
+        "You are a concise assistant that rewrites an assistant's output into a single natural, "
+        "spoken-English sentence suitable for playback by a TTS system. Keep it under 20 words.\n\n"
+        "Return only the spoken sentence (no quotes or extra commentary).\n\n"
+        "Examples:\n"
+        "Assistant content: Done — I've turned on the light in the Living Room, the Dining Room, the Kitchen.\n"
+        "Applied: [{\"room\":\"living room\",\"new_state\":\"on\"},{\"room\":\"dining room\",\"new_state\":\"on\"},{\"room\":\"kitchen\",\"new_state\":\"on\"}]\n"
+        "Spoken summary: I have turned on the lights in the living room, dining room, and kitchen.\n\n"
+        "Assistant content: Done — I've turned on the light in the Living Room, the Dining Room, the Kitchen, the Bathroom, the Bedroom, and the Office.\n"
+        "Applied: [{\"room\":\"living room\",\"new_state\":\"on\"},{\"room\":\"dining room\",\"new_state\":\"on\"},{\"room\":\"kitchen\",\"new_state\":\"on\"},{\"room\":\"bathroom\",\"new_state\":\"on\"},{\"room\":\"bedroom\",\"new_state\":\"on\"},{\"room\":\"office\",\"new_state\":\"on\"}]\n"
+        "Spoken summary: I have turned on all the lights.\n\n"
+        "Assistant content: Done — I've turned on the living room light.\n"
+        "Applied: {\"room\":\"living room\",\"new_state\":\"on\"}\n"
+        "Spoken summary: I have turned on the living room light.\n\n"
+        "Rules: If 'applied' includes 'all' or 4+ rooms, say 'I have turned on all the lights'.\n"
+        "When listing rooms, use 'the' before room names and list up to three rooms, joining with commas and 'and'.\n"
+        "Keep output short and directly suitable for TTS."
+    )
+    user_msg = f"Assistant content: {safe_text}\nApplied: {json.dumps(applied, default=str)}"
+
+    # choose preferred model order
+    if prefer == 'cloud':
+        order = ['cloud', 'local']
+    elif prefer == 'local':
+        order = ['local', 'cloud']
+    else:
+        order = ['cloud', 'local'] if getattr(llm_api, 'OPENAI_KEY', None) else ['local', 'cloud']
+
+    chosen = None
+    for s in order:
+        if s == 'cloud' and getattr(llm_api, 'OPENAI_KEY', None):
+            chosen = 'cloud'
+            break
+        if s == 'local' and getattr(llm_api, 'local_llm', None):
+            chosen = 'local'
+            break
+    if not chosen:
+        def _no():
+            yield f"event: app_error\ndata: {json.dumps({'message': 'No LLM available for summarize_stream'})}\n\n"
+            yield "event: done\ndata: {}\n\n"
+        return Response(stream_with_context(_no()), mimetype='text/event-stream')
+    try:
+        print(f"[summarize_stream] chosen={chosen}", flush=True)
+    except Exception:
+        pass
+
+    headers = {'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'}
+
+    def gen():
+        run_id = uuid.uuid4().hex
+        parts = []
+        idx = 0
+        buffer = ''
+        stream_id = uuid.uuid4().hex
+        src = 'cloud' if chosen == 'cloud' else 'local'
+        try:
+            print(f"[summarize_stream][{run_id}] starting using model={chosen} src={src}", flush=True)
+        except Exception:
+            pass
+        try:
+            if chosen == 'cloud':
+                msgs = [{'role': 'system', 'content': system_msg}, {'role': 'user', 'content': user_msg}]
+                payload = {'model': 'gpt-5.2', 'messages': msgs, 'temperature': 0, 'stream': True}
+                hdrs = {'Authorization': f'Bearer {llm_api.OPENAI_KEY}', 'Content-Type': 'application/json'}
+                try:
+                    print(f"[summarize_stream][{run_id}] POSTing to OpenAI...", flush=True)
+                except Exception:
+                    pass
+                resp = requests.post(llm_api.OPENAI_URL, json=payload, headers=hdrs, timeout=(5, 60), stream=True)
+                try:
+                    print(f"[summarize_stream][{run_id}] got response status={getattr(resp, 'status_code', 'NA')}", flush=True)
+                except Exception:
+                    pass
+                for line in resp.iter_lines(decode_unicode=True):
+                    if line is None:
+                        continue
+                    s = line.strip()
+                    if not s:
+                        continue
+                    if s.startswith('data:'):
+                        s = s[len('data:'):].strip()
+                    if s == '[DONE]':
+                        break
+                    try:
+                        obj = json.loads(s)
+                    except Exception:
+                        continue
+                    try:
+                        delta = obj.get('choices', [])[0].get('delta', {}).get('content', '')
+                    except Exception:
+                        delta = ''
+                    if not delta:
+                        continue
+                    try:
+                        print(f"[summarize_stream][{run_id}] received delta len={len(delta)}", flush=True)
+                    except Exception:
+                        pass
+                    # emit streaming text delta for clients
+                    try:
+                        yield f"event: model_text\ndata: {json.dumps({'model': 'summarizer', 'text': delta, 'stream_id': stream_id})}\n\n"
+                    except Exception:
+                        pass
+                    buffer += str(delta)
+                    # check for complete sentences
+                    try:
+                        sentences, remainder = tts._extract_sentences(buffer)
+                    except Exception:
+                        sentences, remainder = [], buffer
+                    if sentences:
+                        for sent in sentences:
+                            try:
+                                try:
+                                    print(f"[summarize_stream][{run_id}] synth idx={idx} start (src={src})", flush=True)
+                                except Exception:
+                                    pass
+                                t0 = time.perf_counter()
+                                if src == 'cloud':
+                                    if not tts.cloud_tts_provider:
+                                        raise RuntimeError('cloud TTS provider not configured')
+                                    audio = tts.cloud_tts_provider.synthesize_speech(sent, None)
+                                else:
+                                    if not tts.local_tts_provider:
+                                        raise RuntimeError('local TTS provider not configured')
+                                    audio = tts.local_tts_provider.synthesize_speech(sent, None)
+                                t1 = time.perf_counter()
+                                tts_ms = (t1 - t0) * 1000.0
+                                try:
+                                    print(f"[summarize_stream][{run_id}] synth idx={idx} done bytes={len(bytes(audio))}", flush=True)
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                try:
+                                    yield f"event: app_error\ndata: {json.dumps({'message': 'TTS failed', 'error': str(e)})}\n\n"
+                                except Exception:
+                                    pass
+                                continue
+                            try:
+                                parts.append(bytes(audio))
+                                try:
+                                    chunk_path = tts._save_chunk_audio(run_id, idx, src, audio)
+                                    with tts._TTS_JOB_LOCK:
+                                        job = tts.JOBS.get(run_id) or {}
+                                        job.setdefault('chunks', []).append(chunk_path)
+                                        tts.JOBS[run_id] = job
+                                except Exception:
+                                    pass
+                                audio_b64 = base64.b64encode(bytes(audio)).decode('utf-8')
+                                yield f"event: sentence\ndata: {json.dumps({'index': idx, 'audio_data': audio_b64, 'mime_type': 'audio/mpeg', 'text': sent, 'tts_ms': tts_ms, 'source': src, 'model': src, 'stream_id': stream_id})}\n\n"
+                            except Exception:
+                                pass
+                            try:
+                                print(f"[summarize_stream][{run_id}] yielded sentence idx={idx}", flush=True)
+                            except Exception:
+                                pass
+                            idx += 1
+                        buffer = remainder
+
+                # final model event with full content
+                try:
+                    yield f"event: model\ndata: {json.dumps({'model': 'summarizer', 'ok': True, 'content': buffer, 'stream_id': stream_id})}\n\n"
+                except Exception:
+                    pass
+
+            else:
+                # local streaming LLM (similar to local worker in chat stream)
+                if not getattr(llm_api, 'local_llm', None):
+                    yield f"event: app_error\ndata: {json.dumps({'message': 'local LLM not configured'})}\n\n"
+                else:
+                    sys_prompt = llm_api.local_llm.SYSTEM_PROMPT if hasattr(llm_api.local_llm, 'SYSTEM_PROMPT') else ''
+                    msgs = [{'role': 'system', 'content': sys_prompt}, {'role': 'user', 'content': user_msg}]
+                    payload = {'model': getattr(llm_api.local_llm, 'MODEL', None) or 'local', 'messages': msgs, 'stream': True, 'temperature': 0}
+                    url = getattr(llm_api.local_llm, 'LLM_SERVER_URL', None)
+                    if not url:
+                        yield f"event: app_error\ndata: {json.dumps({'message': 'local LLM URL not configured'})}\n\n"
+                    else:
+                        resp = requests.post(url, json=payload, timeout=(5, 60), stream=True)
+                        for line in resp.iter_lines(decode_unicode=True):
+                            if line is None:
+                                continue
+                            s = line.strip()
+                            if not s:
+                                continue
+                            if s.startswith('data:'):
+                                s = s[len('data:'):].strip()
+                            if s == '[DONE]':
+                                break
+                            try:
+                                obj = json.loads(s)
+                            except Exception:
+                                continue
+                            try:
+                                delta = obj.get('choices', [])[0].get('delta', {}).get('content', '')
+                            except Exception:
+                                delta = ''
+                            if not delta:
+                                continue
+                            try:
+                                yield f"event: model_text\ndata: {json.dumps({'model': 'summarizer', 'text': delta, 'stream_id': stream_id})}\n\n"
+                            except Exception:
+                                pass
+                            buffer += str(delta)
+                            try:
+                                sentences, remainder = tts._extract_sentences(buffer)
+                            except Exception:
+                                sentences, remainder = [], buffer
+                            if sentences:
+                                for sent in sentences:
+                                    try:
+                                        yield f"event: tts_queued\ndata: {json.dumps({'model': src, 'stream_id': stream_id})}\n\n"
+                                    except Exception:
+                                        pass
+                                    try:
+                                        t0 = time.perf_counter()
+                                        if src == 'cloud':
+                                            if not tts.cloud_tts_provider:
+                                                raise RuntimeError('cloud TTS provider not configured')
+                                            audio = tts.cloud_tts_provider.synthesize_speech(sent, None)
+                                        else:
+                                            if not tts.local_tts_provider:
+                                                raise RuntimeError('local TTS provider not configured')
+                                            audio = tts.local_tts_provider.synthesize_speech(sent, None)
+                                        t1 = time.perf_counter()
+                                        tts_ms = (t1 - t0) * 1000.0
+                                    except Exception as e:
+                                        try:
+                                            yield f"event: app_error\ndata: {json.dumps({'message': 'TTS failed', 'error': str(e)})}\n\n"
+                                        except Exception:
+                                            pass
+                                        continue
+                                    try:
+                                        parts.append(bytes(audio))
+                                        try:
+                                            chunk_path = tts._save_chunk_audio(run_id, idx, src, audio)
+                                            with tts._TTS_JOB_LOCK:
+                                                job = tts.JOBS.get(run_id) or {}
+                                                job.setdefault('chunks', []).append(chunk_path)
+                                                tts.JOBS[run_id] = job
+                                        except Exception:
+                                            pass
+                                        audio_b64 = base64.b64encode(bytes(audio)).decode('utf-8')
+                                        yield f"event: sentence\ndata: {json.dumps({'index': idx, 'audio_data': audio_b64, 'mime_type': 'audio/mpeg', 'text': sent, 'tts_ms': tts_ms, 'source': src, 'model': src, 'stream_id': stream_id})}\n\n"
+                                    except Exception:
+                                        pass
+                                    idx += 1
+                                buffer = remainder
+                        try:
+                            yield f"event: model\ndata: {json.dumps({'model': 'summarizer', 'ok': True, 'content': buffer, 'stream_id': stream_id})}\n\n"
+                        except Exception:
+                            pass
+
+        except Exception as e:
+            try:
+                yield f"event: app_error\ndata: {json.dumps({'message': str(e)})}\n\n"
+            except Exception:
+                pass
+
+        # persist final combined audio if we produced chunks
+        try:
+            if parts:
+                full = b''.join(parts)
+                try:
+                    with tts._TTS_JOB_LOCK:
+                        tts.JOBS[run_id] = {'text': safe_text, 'created_at': time.time()}
+                    save_path = tts._save_job_audio(run_id, src, full)
+                    with tts._TTS_JOB_LOCK:
+                        tts.JOBS[run_id][f"{src}_path"] = save_path
+                        tts.JOBS[run_id][f"{src}_bytes"] = full
+                        tts.JOBS[run_id][src] = full
+                        tts.JOBS[run_id]['status'] = {src: 'done'}
+                except Exception:
+                    pass
+                try:
+                    yield f"event: final_audio\ndata: {json.dumps({'url': f'/api/tts/file/{run_id}?source={src}'})}\n\n"
+                except Exception:
+                    pass
+                try:
+                    audio_b64_full = base64.b64encode(full).decode('utf-8')
+                    yield f"event: final_audio_bytes\ndata: {json.dumps({'audio_data': audio_b64_full, 'mime_type': 'audio/mpeg'})}\n\n"
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        yield "event: done\ndata: {}\n\n"
+
+    return Response(stream_with_context(gen()), mimetype='text/event-stream', headers=headers)
 
 
 @app.route('/api/stt', methods=['POST'])
