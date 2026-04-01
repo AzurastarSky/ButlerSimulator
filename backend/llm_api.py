@@ -30,10 +30,8 @@ except Exception:
 
 try:
     from .helpers import norm_room, norm_device, clamp
-except Exception:
-    def norm_room(v: str) -> str: return (v or "").strip().lower()
-    def norm_device(v: str) -> str: return (v or "").strip().lower()
-    def clamp(v: float, lo: float, hi: float) -> float: return max(lo, min(hi, v))
+except ImportError:
+    from helpers import norm_room, norm_device, clamp
 
 
 def post_chat_openai(history: List[dict]) -> dict:
@@ -72,10 +70,7 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
     try:
         print(f"[apply_toolcall] target={target} js={json.dumps(js, ensure_ascii=False)}")
     except Exception:
-        try:
-            print(f"[apply_toolcall] target={target} js={str(js)}")
-        except Exception:
-            pass
+        print(f"[apply_toolcall] target={target} js={str(js)}")
 
     tool = js.get("tool")
     if tool not in {"manage_device", "query_state"}:
@@ -83,11 +78,14 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
 
     raw_room = js.get("room", "") or ""
     rooms_field = js.get("rooms", None)
+    
+    # Normalize room input
     if isinstance(raw_room, list) and not rooms_field:
         rooms_field = raw_room
         room = ""
     else:
         room = norm_room(raw_room) if not isinstance(raw_room, list) else ""
+    
     device = norm_device(js.get("device", ""))
     action = (js.get("action", "") or "").strip().lower()
     value = js.get("value", None)
@@ -96,15 +94,6 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
     house_store = state.HOUSE_LOCAL if target == 'local' else state.HOUSE_CLOUD
 
     if tool == 'query_state':
-        raw_room = js.get('room', '') or ''
-        rooms_field = js.get('rooms', None)
-        if isinstance(raw_room, list) and not rooms_field:
-            rooms_field = raw_room
-            room = ''
-        else:
-            room = norm_room(raw_room) if not isinstance(raw_room, list) else ''
-
-        device = norm_device(js.get('device', ''))
         if device == 'thermostat':
             return {'ok': True, 'query': {'device': 'thermostat', 'target_store': target}, 'result': {'thermostat': dict(house_store)}}
 
@@ -138,27 +127,20 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
             return {"ok": False, "error": f"Unknown thermostat action: {action}"}
 
         if action in {"increase", "decrease"} and (value is None):
-            try:
-                if local_llm and hasattr(local_llm, 'infer_thermo_step') and last_user_text:
-                    inferred = local_llm.infer_thermo_step(last_user_text)
-                    if inferred is not None:
-                        value = inferred
-                        # record that we inferred a value so callers can see what was used
-                        try:
-                            js['value'] = inferred
-                            js['_inferred_value'] = True
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+            if local_llm and hasattr(local_llm, 'infer_thermo_step') and last_user_text:
+                inferred = local_llm.infer_thermo_step(last_user_text)
+                if inferred is not None:
+                    value = inferred
+                    js['value'] = inferred
+                    js['_inferred_value'] = True
 
         step = 1.0
         if value is not None:
             try:
                 step = float(value)
-            except:
+            except (TypeError, ValueError):
                 pass
-        # record previous target for clearer return data
+        
         prev_target = float(house_store.get("target", 20.0))
         if action == "increase":
             house_store["target"] = clamp(prev_target + step, 10.0, 28.0)
@@ -182,18 +164,10 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
         else:
             state._update_house_temp()
 
-        try:
-            state.publish_state_event()
-        except Exception:
-            pass
+        state.publish_state_event()
 
         # Return the numeric step/value used and previous/new targets for clarity
-        used_value = None
-        try:
-            used_value = float(value) if value is not None else step
-        except Exception:
-            used_value = step
-
+        used_value = float(value) if value is not None else step
         return {"ok": True, "device": "thermostat", "action": action, "used_value": used_value, "prev_target": prev_target, "new_target": float(house_store.get("target", prev_target)), "house": house_store}
 
     if device not in {"light"}:
@@ -220,24 +194,17 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
         if not r or r not in rooms_store or device not in rooms_store[r]:
             skipped.append(r)
             continue
-        cur = rooms_store[r][device]
-        new_state = ("on" if action == "turn_on" else "off" if action == "turn_off" else ("off" if cur == "on" else "on"))
+        new_state = "on" if action == "turn_on" else "off"
         rooms_store[r][device] = new_state
         applied.append({"room": r, "new_state": new_state})
 
-    try:
-        if applied:
-            print(f"[apply_toolcall] applied={json.dumps(applied, ensure_ascii=False)} target={target}")
-        if skipped:
-            print(f"[apply_toolcall] skipped={json.dumps(skipped, ensure_ascii=False)} target={target}")
-    except Exception:
-        pass
+    if applied:
+        print(f"[apply_toolcall] applied={json.dumps(applied, ensure_ascii=False)} target={target}")
+    if skipped:
+        print(f"[apply_toolcall] skipped={json.dumps(skipped, ensure_ascii=False)} target={target}")
 
     if applied:
-        try:
-            state.publish_state_event()
-        except Exception:
-            pass
+        state.publish_state_event()
 
     if len(applied) > 1 or (len(skipped) > 0 and len(applied) > 0):
         return {"ok": True, "bulk": True, "scope": rooms_field or room, "device": device, "action": action, "applied": applied, "skipped": skipped}
@@ -245,11 +212,7 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
     if room not in rooms_store or device not in rooms_store[room]:
         return {"ok": False, "error": f"Unsupported room/device. Known rooms: {list(rooms_store.keys())}"}
 
-    cur = rooms_store[room][device]
-    new_state = ("on" if action == "turn_on" else "off" if action == "turn_off" else ("off" if cur == "on" else "on"))
+    new_state = "on" if action == "turn_on" else "off"
     rooms_store[room][device] = new_state
-    try:
-        state.publish_state_event()
-    except Exception:
-        pass
+    state.publish_state_event()
     return {"ok": True, "room": room, "device": device, "action": action, "new_state": new_state}

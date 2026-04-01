@@ -2,20 +2,15 @@ import time
 import threading
 import copy
 import json
+import queue
 from pathlib import Path
 import os
 
-# Minimal helpers fallback if helpers.py isn't importable
+# Import helpers
 try:
-    from .helpers import norm_room, norm_device, clamp, ROOM_SYNONYMS, DEVICE_SYNONYMS, VALID_ROOMS, VALID_DEVICES
-except Exception:
-    ROOM_SYNONYMS = {}
-    DEVICE_SYNONYMS = {}
-    def norm_room(v: str) -> str: return (v or "").strip().lower()
-    def norm_device(v: str) -> str: return (v or "").strip().lower()
-    VALID_ROOMS = set()
-    VALID_DEVICES = set()
-    def clamp(v: float, lo: float, hi: float) -> float: return max(lo, min(hi, v))
+    from .helpers import norm_room, norm_device, clamp
+except ImportError:
+    from helpers import norm_room, norm_device, clamp
 
 # ---------------- In-memory State ----------------
 STATE = {
@@ -64,7 +59,7 @@ def publish_state_event():
     for q in subs:
         try:
             q.put_nowait(payload)
-        except Exception:
+        except queue.Full:
             pass
 
 
@@ -85,25 +80,10 @@ def _update_house_temp_cloud():
 
 def _state_publisher_loop(poll_interval: float = 1.0):
     while True:
-        try:
-            try:
-                _update_house_temp_local()
-            except Exception:
-                pass
-            try:
-                _update_house_temp_cloud()
-            except Exception:
-                pass
-            try:
-                _update_house_temp()
-            except Exception:
-                pass
-            try:
-                publish_state_event()
-            except Exception:
-                pass
-        except Exception:
-            pass
+        _update_house_temp_local()
+        _update_house_temp_cloud()
+        _update_house_temp()
+        publish_state_event()
         time.sleep(poll_interval)
 
 
@@ -116,8 +96,5 @@ def ensure_state_publisher():
     t.start()
 
 
-# Start when module imported
-try:
-    ensure_state_publisher()
-except Exception:
-    pass
+# Start state publisher when module imported
+ensure_state_publisher()

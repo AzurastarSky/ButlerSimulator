@@ -270,10 +270,12 @@ function ensureRespEl(who){
     const parent = who === 'local' ? floorLocal.parentElement : floorCloud.parentElement;
     mel = document.createElement('div');
     mel.id = metricsId;
-    mel.style.fontSize = '12px';
-    mel.style.color = '#7b8794';
-    mel.style.margin = '2px 10px 8px 10px';
-    mel.style.minHeight = '16px';
+    mel.style.fontSize = '16px';
+    mel.style.fontWeight = '600';
+    mel.style.color = '#a0aab5';
+    mel.style.margin = '8px 10px 12px 10px';
+    mel.style.minHeight = '24px';
+    mel.style.textAlign = 'center';
     parent.insertBefore(mel, parent.children[2]);
   }
   return el;
@@ -285,7 +287,12 @@ function _metricsSet(who, key, val){
   // Only handle TTFA metric now: key === 'ttfa'
   if (key !== 'ttfa') return;
   const metricsId = who === 'local' ? 'metrics-local' : 'metrics-cloud';
-  const mid = document.getElementById(metricsId);
+  let mid = document.getElementById(metricsId);
+  if (!mid) {
+    // Element doesn't exist yet, ensure it's created
+    ensureRespEl(who);
+    mid = document.getElementById(metricsId);
+  }
   if (!mid) return;
   try{
     if (val === null || typeof val === 'undefined' || val === ''){
@@ -303,6 +310,7 @@ function openRaceSSE(text){
   const es = new EventSource(url);
   let esStreamId = null;
   let sawSentence = false;
+  let firstAudioReceived = { local: false, cloud: false };
   ensureRespEl('local').textContent = 'waiting...';
   ensureRespEl('cloud').textContent = 'waiting...';
   es.addEventListener('model', async (ev) => {
@@ -398,9 +406,17 @@ function openRaceSSE(text){
           if (payload.stream_id && esStreamId && payload.stream_id !== esStreamId) return;
           // mark that server is providing sentence audio (prevents duplicate client TTS)
           sawSentence = true;
+          const who = payload.model || payload.source || 'local';
+          
+          // Track TTFA for first audio sentence from each model
+          if (!firstAudioReceived[who]) {
+            firstAudioReceived[who] = true;
+            const ms = Date.now() - promptStart;
+            _metricsSet(who, 'ttfa', ms);
+          }
+          
           const b64 = payload.audio_data || payload.audio || '';
           if (!b64) return;
-          const who = payload.model || payload.source || 'local';
           const binStr = atob(b64);
           const len = binStr.length;
           const arr = new Uint8Array(len);
@@ -555,7 +571,10 @@ async function streamTtsSentencesViaFetch(text, source='local', voice=undefined,
         if (!firstSentReceived){
           firstSentReceived = true;
           try{
-            if (ttfaStart){ const ms = Date.now() - Number(ttfaStart); _metricsSet(source, 'ttfa', ms); }
+            if (ttfaStart){ 
+              const ms = Date.now() - Number(ttfaStart); 
+              _metricsSet(source, 'ttfa', ms); 
+            }
           }catch(e){/*ignore*/}
         }
         // start playing if idle
@@ -748,7 +767,11 @@ async function streamSummarizeAndPlay(text, applied, prefer='cloud', who='local'
           const text = obj.text || '';
           if (!text) return;
           const el = ensureRespEl(who);
-          try{ el.textContent = (el.textContent || '') + text; }catch(e){}
+          try{ 
+            const current = el.textContent || '';
+            const separator = current && !current.endsWith(' ') && !current.endsWith('\n') ? '  ' : '';
+            el.textContent = current + separator + text;
+          }catch(e){}
         }catch(e){ console.warn('model_text parse error (summarize_stream)', e); }
       } else if (evt === 'tts_queued'){
         try{ if (onFirstSentence) onFirstSentence(); }catch(e){}

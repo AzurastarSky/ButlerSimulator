@@ -1,26 +1,14 @@
 from typing import Any, Dict, List, Optional, Tuple
 import json, re, requests
 
-# Try to import shared helpers (room/device synonyms + normalizers)
+# Import shared helpers (room/device synonyms + normalizers)
 try:
-    from .helpers import norm_room, norm_device, ROOM_SYNONYMS, DEVICE_SYNONYMS, VALID_ROOMS, VALID_DEVICES
-except Exception:
-    try:
-        from helpers import norm_room, norm_device, ROOM_SYNONYMS, DEVICE_SYNONYMS, VALID_ROOMS, VALID_DEVICES
-    except Exception:
-        # Fallbacks if helpers not importable (very defensive)
-        ROOM_SYNONYMS = {}
-        DEVICE_SYNONYMS = {}
-        def norm_room(v: str) -> str:
-            return (v or "").strip().lower()
-        def norm_device(v: str) -> str:
-            return (v or "").strip().lower()
-        VALID_ROOMS = set()
-        VALID_DEVICES = set()
+    from .helpers import norm_room, norm_device, VALID_ROOMS, VALID_DEVICES
+except ImportError:
+    from helpers import norm_room, norm_device, VALID_ROOMS, VALID_DEVICES
 
 # ---------------- Config ----------------
 LLM_SERVER_URL = "http://192.168.0.222:8080/v1/chat/completions"
-#LLM_SERVER_URL = "http://192.168.1.245:8080/v1/chat/completions"
 MODEL = "Qwen2.5-3B-Instruct"
 
 API_DEVICE = "http://127.0.0.1:5000/api/device"
@@ -65,7 +53,7 @@ User: It is dim in the office.
 
 VALID_ACTIONS = {
     "light": {"turn_on", "turn_off"},
-    # blinds removed from setup — only thermostat and light supported
+
     "thermostat": {"increase", "decrease", "set_value", "turn_on", "turn_off"},
 }
 
@@ -185,26 +173,23 @@ def validate(js: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     if tool == "manage_device":
         # Accept either a single room string, a comma/and-separated room list, or a 'rooms' list
         raw_room = js.get("room", "") or ""
-        room = (raw_room or "").strip().lower()
         rooms_list = js.get("rooms", None)
 
-        # normalize comma/and separated room strings into a list for validation if provided
-        if isinstance(room, str) and ("," in room or " and " in room):
-            parts = [r.strip().lower() for r in re.split(r",| and ", room) if r.strip()]
+        # Normalize comma/and separated room strings into a list for validation
+        if isinstance(raw_room, str) and ("," in raw_room or " and " in raw_room):
+            parts = [norm_room(r.strip()) for r in re.split(r",| and ", raw_room) if r.strip()]
         else:
-            parts = [room] if room else []
+            parts = [norm_room(raw_room)] if raw_room else []
 
         if isinstance(rooms_list, list):
-            raw_list = [str(r).strip() for r in rooms_list]
+            list_to_check = [norm_room(str(r)) for r in rooms_list if r]
         else:
-            raw_list = parts
+            list_to_check = parts
 
-        # Normalize room names with `norm_room` so phrases like "the office" -> "office"
-        list_to_check = [norm_room(r) for r in raw_list if r]
-        device = (js.get("device", "") or "").strip().lower()
+        device = norm_device(js.get("device", "") or "")
         action = (js.get("action", "") or "").strip().lower()
 
-        # Ensure all specified rooms are valid
+        # Ensure all specified rooms are valid (exclude "house" from device control)
         invalid = [r for r in list_to_check if r and r not in (VALID_ROOMS - {"house"})]
         if invalid:
             return False, f"invalid room(s): {invalid}"
@@ -216,20 +201,21 @@ def validate(js: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
             return False, f"invalid action for {device}: {action}"
 
         if device == "thermostat" and action == "set_value":
+            if "value" not in js or js.get("value") is None:
+                return False, "thermostat set_value requires numeric 'value'"
             try:
-                float(js.get("value", ""))
-            except Exception:
+                float(js.get("value"))
+            except (TypeError, ValueError):
                 return False, "thermostat set_value requires numeric 'value'"
 
         return True, None
 
     if tool == "query_state":
-        room_raw = (js.get("room", "") or "").strip()
-        room = norm_room(room_raw)
-        device = (js.get("device", "all") or "all").strip().lower()
+        room = norm_room(js.get("room", "") or "")
+        device = norm_device(js.get("device", "all") or "all")
 
         if room not in VALID_ROOMS:
-            return False, f"invalid room for query: {room_raw}"
+            return False, f"invalid room for query: {js.get('room', '')}"
 
         if device != "all" and device not in VALID_DEVICES:
             return False, f"invalid device for query: {device}"
@@ -243,34 +229,20 @@ def infer_thermo_step(user_text: str) -> Optional[float]:
     if not user_text:
         return None
 
-    text = (user_text or "").strip()
+    text = user_text.strip()
 
-    # explicit numeric 'by N' first
+    # Explicit numeric 'by N' first
     match = BY_NUMBER.search(text)
     if match:
         try:
             return float(match.group(1))
-        except Exception:
+        except (TypeError, ValueError):
             pass
 
-    # regex patterns (ordered)
+    # Regex patterns (ordered by intensity)
     for pattern, step in INTENSITY_STEPS:
-        try:
-            if pattern.search(text):
-                return step
-        except Exception:
-            continue
-
-    # Fallback substring checks for common adjectives (catch simple cases)
-    low = text.lower()
-    if any(w in low for w in ("way too", "extremely", "super")):
-        return 4.0
-    if any(w in low for w in ("very", "too", "really")):
-        return 3.0
-    if any(w in low for w in ("quite", "pretty", "fairly", "somewhat")):
-        return 2.0
-    if any(w in low for w in ("a little", "a bit", "slightly", "bit", "little")):
-        return 1.0
+        if pattern.search(text):
+            return step
 
     return None
 
@@ -280,13 +252,12 @@ def infer_thermo_target(user_text: str) -> Optional[float]:
         return None
 
     match = TO_NUMBER.search(user_text)
-    if not match:
-        return None
-
-    try:
-        return float(match.group(1))
-    except Exception:
-        return None
+    if match:
+        try:
+            return float(match.group(1))
+        except (TypeError, ValueError):
+            pass
+    return None
 
 
 def infer_comfort_direction(user_text: str) -> Optional[str]:
@@ -299,10 +270,6 @@ def infer_comfort_direction(user_text: str) -> Optional[str]:
         return "increase"
 
     return None
-
-
-BRIGHT_WORDS = {"bright", "too bright", "a bit bright", "very bright", "so bright"}
-DIM_WORDS = {"dim", "a bit dim", "a little dim", "too dark", "dark", "a bit dark"}
 
 
 def try_autocorrect(js: Dict[str, Any], user_text: str) -> Dict[str, Any]:
@@ -324,26 +291,16 @@ def try_autocorrect(js: Dict[str, Any], user_text: str) -> Dict[str, Any]:
     device = norm_device(js.get("device", "") or "")
     action = (js.get("action", "") or "").strip().lower()
 
-    # If model suggested an action that isn't valid for the device, attempt correction
-    valid_for_device = VALID_ACTIONS.get(device, set())
-
     # Map brightness hints to actions
     if device == "light":
-        if any(w in user_text for w in DIM_WORDS) and "turn_on" not in valid_for_device:
-            # If the user says it's dim, prefer turning on the light (or increase)
+        if any(w in user_text for w in ["dim", "a bit dim", "a little dim", "too dark", "dark", "a bit dark"]):
             action = "turn_on"
-
-        if any(w in user_text for w in DIM_WORDS) and "turn_on" in valid_for_device:
-            action = "turn_on"
-
-        if any(w in user_text for w in BRIGHT_WORDS):
-            # No blinds in this setup — prefer turning lights off when user mentions brightness
+        elif any(w in user_text for w in ["bright", "too bright", "a bit bright", "very bright", "so bright"]):
             action = "turn_off"
 
-    # Translate generic increase/decrease intents into on/off or open/close
-    if action in {"increase", "decrease"}:
-        if device == "light":
-            action = "turn_on" if action == "increase" else "turn_off"
+    # Translate generic increase/decrease intents into on/off for lights
+    if action in {"increase", "decrease"} and device == "light":
+        action = "turn_on" if action == "increase" else "turn_off"
 
     # Apply corrections back to js
     js["device"] = device
@@ -555,6 +512,7 @@ def handle(resp_json: Dict[str, Any], last_user_text: str) -> Tuple[Optional[str
         print("TOOL CALL:", json.dumps(parsed, ensure_ascii=False))
         result = execute_manage_device(room, device, action, value)
         reply = friendly_control_reply(result)
+        print("\n")
         print("Butler:", reply)
         return content, reply
 
@@ -564,6 +522,7 @@ def handle(resp_json: Dict[str, Any], last_user_text: str) -> Tuple[Optional[str
         print("TOOL CALL:", json.dumps(parsed, ensure_ascii=False))
         result = execute_query_state(room, device)
         reply = friendly_query_reply(result)
+        print("\n")
         print("Butler:", reply)
         return content, reply
 

@@ -24,7 +24,7 @@ def synthesize_speech(text: str, voice: Optional[str] = None) -> bytes:
 
     Args:
         text: text to synthesize
-        voice: voice name (e.g., 'sage')
+        voice: voice name (e.g., 'onyx', 'alloy', 'echo')
 
     Returns bytes (audio/mpeg) or raises Exception on failure.
     """
@@ -33,7 +33,7 @@ def synthesize_speech(text: str, voice: Optional[str] = None) -> bytes:
 
     payload = {
         "model": "tts-1",
-        "voice": voice or "sage",
+        "voice": voice or "onyx",
         "input": text,
     }
 
