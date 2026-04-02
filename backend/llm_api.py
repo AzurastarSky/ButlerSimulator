@@ -29,6 +29,11 @@ except Exception:
     import state
 
 try:
+    from . import weather
+except Exception:
+    import weather
+
+try:
     from .helpers import norm_room, norm_device, clamp
 except ImportError:
     from helpers import norm_room, norm_device, clamp
@@ -73,8 +78,19 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
         print(f"[apply_toolcall] target={target} js={str(js)}")
 
     tool = js.get("tool")
-    if tool not in {"manage_device", "query_state"}:
+    if tool not in {"manage_device", "query_state", "get_weather"}:
         return {"ok": False, "error": "unsupported tool"}
+
+    # Handle weather tool
+    if tool == "get_weather":
+        weather_data = weather.get_current_weather()
+        weather_summary = weather.format_weather_for_llm(weather_data)
+        return {
+            "ok": weather_data.get("ok", True),
+            "tool": "get_weather",
+            "data": weather_data,
+            "summary": weather_summary
+        }
 
     raw_room = js.get("room", "") or ""
     rooms_field = js.get("rooms", None)

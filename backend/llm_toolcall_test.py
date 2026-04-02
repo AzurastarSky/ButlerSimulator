@@ -1,5 +1,5 @@
 from typing import Any, Dict, List, Optional, Tuple
-import json, re, requests
+import json, re, requests, os
 
 # Import shared helpers (room/device synonyms + normalizers)
 try:
@@ -7,8 +7,16 @@ try:
 except ImportError:
     from helpers import norm_room, norm_device, VALID_ROOMS, VALID_DEVICES
 
+# Import weather module
+try:
+    from . import weather
+except ImportError:
+    import weather
+
 # ---------------- Config ----------------
-LLM_SERVER_URL = "http://192.168.0.222:8080/v1/chat/completions"
+LOCAL_BOARD_IP = os.getenv("LOCAL_BOARD_IP", "192.168.0.222")
+LOCAL_BOARD_PORT = os.getenv("LOCAL_BOARD_PORT", "8080")
+LLM_SERVER_URL = f"http://{LOCAL_BOARD_IP}:{LOCAL_BOARD_PORT}/v1/chat/completions"
 MODEL = "Qwen2.5-3B-Instruct"
 
 API_DEVICE = "http://127.0.0.1:5000/api/device"
@@ -19,35 +27,87 @@ MAX_HISTORY = 8
 TIMEOUT = (10, 60)
 
 
-SYSTEM_PROMPT = """
-You are Butler. Only use JSON tool outputs for the following two supported tools: `manage_device` and `query_state` otherwise respond in helpful natural language without JSON.
+def get_system_prompt(filler_mode='auto'):
+    """
+    Generate system prompt based on filler mode.
+    filler_mode: 'on' (required), 'off' (none), 'auto' (optional)
+    """
+    
+    filler_instruction = ""
+    light_on_filler = ""
+    light_off_filler = ""
+    thermo_increase_filler = ""
+    thermo_decrease_filler = ""
+    weather_filler = ""
+    
+    if filler_mode == 'on':
+        filler_instruction = '\n\nFILLER (required): Always include a brief contextually appropriate phrase in "filler" field. Examples: lights="Turning that on/off", thermostat increase="Warming that up", thermostat decrease="Cooling it down", weather="Let me check"'
+        light_on_filler = ',"filler":"One moment"'
+        light_off_filler = ',"filler":"Turning that off"'
+        thermo_increase_filler = ',"filler":"Warming that up"'
+        thermo_decrease_filler = ',"filler":"Cooling it down"'
+        weather_filler = ',"filler":"Let me check"'
+    elif filler_mode == 'auto':
+        filler_instruction = '\n\nFILLER (optional): You may include a brief contextually appropriate phrase in "filler" field. Examples: lights="Turning that on/off", thermostat increase="Warming that up", thermostat decrease="Cooling it down", weather="Let me check"'
+        light_on_filler = ',"filler":"One moment"'
+        light_off_filler = ',"filler":"Turning that off"'
+        thermo_increase_filler = ',"filler":"Warming that up"'
+        thermo_decrease_filler = ',"filler":"Cooling it down"'
+        weather_filler = ',"filler":"Let me check"'
+    # else 'off' - no filler instruction or examples
+    
+    return f"""
+You are Butler. You control devices using JSON tool calls.
 
-When controlling devices, produce JSON exactly in this shape:
-{"tool":"manage_device","room":"<living room|dining room|kitchen|bathroom|bedroom|office|all|upstairs|downstairs>","device":"<light|thermostat>","action":"<turn_on|turn_off|increase|decrease|set_value>","value":"<number optional>"}
+TOOL FORMAT:
+Device control: {{"tool":"manage_device","room":"all","device":"light","action":"turn_on"{light_on_filler}}}
+State query: {{"tool":"query_state","room":"house","device":"thermostat"}}
+Weather: {{"tool":"get_weather"{weather_filler}}}{filler_instruction}
 
-If the user refers to multiple rooms, emit a `rooms` array instead of a single `room` string. Example:
-{"tool":"manage_device","rooms":["dining room","kitchen"],"device":"light","action":"turn_on"}
+ROOMS: living room, dining room, kitchen, bathroom, bedroom, office, all, upstairs, downstairs
+DEVICES: light, thermostat
+LIGHT ACTIONS: turn_on, turn_off (only these two)
+THERMOSTAT ACTIONS: increase, decrease, set_value
 
-IMPORTANT: For device `light`, only use actions `turn_on` or `turn_off`. Do NOT use `increase` or `decrease` for lights — those are for the thermostat only.
+THERMOSTAT RULES - SIMPLE:
+User says COLD/CHILLY/FREEZING → action: "increase"
+User says HOT/WARM/BOILING → action: "decrease"
+Increase = make warmer. Decrease = make cooler.
 
-When querying state, produce JSON exactly in this shape:
-{"tool":"query_state","room":"<house|living room|dining room|kitchen|bathroom|bedroom|office|all|upstairs|downstairs>","device":"<light|thermostat|all optional>"}
+VALUE GUIDE (if not specified):
+a bit/little/slightly = 1
+quite/pretty/fairly = 2
+very/really/too = 3
+extremely/way too = 4
 
-If the user's request is NOT about device control or state (for example: storytelling, general chat, summaries, creative writing, or other conversational replies), DO NOT emit JSON or tool invocations. Instead, respond in plain natural language (no JSON) with a helpful assistant reply.
+WEATHER QUESTIONS include: "What's the weather?", "Do I need a jacket?", "Can I wear shorts?", "Should I bring an umbrella?", "Is it nice out?"
 
-If there is ambiguity about whether the user intends a device action, prefer a short clarifying natural-language question rather than emitting a tool call.
+EXAMPLES:
 
-Temperature intent rules:
-- cold/chilly/freezing -> thermostat increase; hot/warm/boiling/roasting -> decrease
-- numeric phrasing ('increase/decrease by X' or 'set to X') must include value=X
-- intensity (no number): a bit/slightly=1; quite/pretty/fairly/somewhat=2; very/really/too=3; extremely/way too=4
+User: I am a bit cold
+{{"tool":"manage_device","room":"all","device":"thermostat","action":"increase","value":"1"{thermo_increase_filler}}}
 
-Examples:
-User: I am a little cold
-{"tool":"manage_device","room":"all","device":"thermostat","action":"increase","value":"1","intensity":1}
-User: It is dim in the office.
-{"tool":"manage_device","room":"office","device":"light","action":"turn_on"}
+User: It is really cold
+{{"tool":"manage_device","room":"all","device":"thermostat","action":"increase","value":"3"{thermo_increase_filler}}}
+
+User: It's too hot
+{{"tool":"manage_device","room":"all","device":"thermostat","action":"decrease","value":"3"{thermo_decrease_filler}}}
+
+User: Turn off the office light
+{{"tool":"manage_device","room":"office","device":"light","action":"turn_off"{light_off_filler}}}
+
+User: Turn on the lights
+{{"tool":"manage_device","room":"all","device":"light","action":"turn_on"{light_on_filler}}}
+
+User: Do I need a jacket?
+{{"tool":"get_weather"{weather_filler}}}
+
+For non-device/weather requests, respond naturally in plain text without JSON.
 """
+
+
+# Default system prompt (auto mode)
+SYSTEM_PROMPT = get_system_prompt('auto')
 
 # VALID_ROOMS and VALID_DEVICES are imported from helpers
 
@@ -220,6 +280,10 @@ def validate(js: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         if device != "all" and device not in VALID_DEVICES:
             return False, f"invalid device for query: {device}"
 
+        return True, None
+
+    if tool == "get_weather":
+        # Weather tool requires no parameters
         return True, None
 
     return False, f"unknown tool: {tool}"
@@ -485,6 +549,11 @@ def handle(resp_json: Dict[str, Any], last_user_text: str) -> Tuple[Optional[str
         return content, None
 
     tool = parsed.get("tool")
+    
+    # Check for optional filler response and speak it before executing tool
+    filler = parsed.get("filler", "").strip()
+    if filler:
+        print("Butler:", filler)
 
     if tool == "manage_device":
         room = parsed.get("room", "")
@@ -512,9 +581,17 @@ def handle(resp_json: Dict[str, Any], last_user_text: str) -> Tuple[Optional[str
         print("TOOL CALL:", json.dumps(parsed, ensure_ascii=False))
         result = execute_manage_device(room, device, action, value)
         reply = friendly_control_reply(result)
-        print("\n")
-        print("Butler:", reply)
-        return content, reply
+        
+        # Combine filler and final reply for TTS
+        if filler:
+            combined_reply = filler  # Return filler to be spoken first
+            print("Butler:", reply)  # Print final result
+        else:
+            combined_reply = reply
+            print("\n")
+            print("Butler:", reply)
+        
+        return content, combined_reply
 
     if tool == "query_state":
         room = parsed.get("room", "")
@@ -522,9 +599,26 @@ def handle(resp_json: Dict[str, Any], last_user_text: str) -> Tuple[Optional[str
         print("TOOL CALL:", json.dumps(parsed, ensure_ascii=False))
         result = execute_query_state(room, device)
         reply = friendly_query_reply(result)
+        
+        # Combine filler and final reply for TTS
+        if filler:
+            combined_reply = filler  # Return filler to be spoken first
+            print("Butler:", reply)  # Print final result
+        else:
+            combined_reply = reply
+            print("\n")
+            print("Butler:", reply)
+        
+        return content, combined_reply
+
+    if tool == "get_weather":
+        print("TOOL CALL:", json.dumps(parsed, ensure_ascii=False))
+        weather_data = weather.get_current_weather()
+        weather_summary = weather.format_weather_for_llm(weather_data)
         print("\n")
-        print("Butler:", reply)
-        return content, reply
+        # Don't print raw weather here, let LLM respond naturally
+        # Return weather summary as tool result for second LLM call
+        return content, weather_summary
 
     reply = parsed.get("reply", "")
     print("Butler:", reply)
@@ -562,9 +656,31 @@ def main() -> None:
 
         try:
             data = post_chat(history)
-            assistant_json, _ = handle(data, user)
+            assistant_json, tool_result = handle(data, user)
             if assistant_json:
                 history.append({"role": "assistant", "content": assistant_json})
+            
+            # If there's a tool result (weather data), use stream_weather_summary for natural response
+            # Other tools already generate friendly replies.
+            if tool_result and "{\"tool\":\"get_weather\"}" in assistant_json:
+                # Use the existing stream_weather_summary function with the user's question
+                weather_data = weather.get_current_weather()
+                
+                # Collect the streaming response
+                natural_response = ""
+                for chunk in weather.stream_weather_summary(weather_data, user_context=user):
+                    natural_response += chunk
+                
+                if natural_response:
+                    print("Butler:", natural_response)
+                    history.append({"role": "assistant", "content": natural_response})
+                else:
+                    # Fallback to formatted weather
+                    print("Butler:", tool_result)
+                    history.append({"role": "assistant", "content": tool_result})
+            elif tool_result:
+                # For other tools (device/state), just add the friendly reply to history
+                history.append({"role": "assistant", "content": tool_result})
         except requests.exceptions.RequestException as e:
             print("[HTTP error contacting LLM server]")
             print(e)

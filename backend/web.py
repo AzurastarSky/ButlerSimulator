@@ -5,12 +5,18 @@ from typing import List
 
 # Prefer package-style relative imports, but allow running `python web.py`
 try:
-    from . import state, tts, llm_api
+    from . import state, tts, llm_api, weather
 except Exception:
-    import state, tts, llm_api
+    import state, tts, llm_api, weather
 
 app = Flask(__name__, static_folder="../frontend", static_url_path="")
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+
+# Application settings
+SETTINGS = {
+    'filler_mode': 'auto'  # Options: 'on', 'off', 'auto'
+}
+SETTINGS_LOCK = threading.Lock()
 
 # optional local STT provider
 try:
@@ -79,6 +85,28 @@ def api_state_stream():
                     pass
 
     return Response(stream_with_context(cleanup()), mimetype='text/event-stream')
+
+
+@app.get('/api/settings')
+def get_settings():
+    """Get current application settings"""
+    with SETTINGS_LOCK:
+        return jsonify(SETTINGS.copy())
+
+
+@app.post('/api/settings/filler-mode')
+def set_filler_mode():
+    """Set filler mode: 'on', 'off', or 'auto'"""
+    data = request.get_json() or {}
+    mode = data.get('mode', '').lower()
+    
+    if mode not in ['on', 'off', 'auto']:
+        return jsonify({'ok': False, 'error': 'Invalid mode. Must be on, off, or auto'}), 400
+    
+    with SETTINGS_LOCK:
+        SETTINGS['filler_mode'] = mode
+    
+    return jsonify({'ok': True, 'filler_mode': mode})
 
 
 @app.post('/api/device')
@@ -177,7 +205,21 @@ def api_chat_cloud():
 @app.get('/api/chat/stream')
 def api_chat_stream():
     user = request.args.get('user', '')
-    history = [{'role': 'user', 'content': user}] if user else []
+    # Accept optional history as JSON-encoded query parameter
+    history_param = request.args.get('history', '')
+    if history_param:
+        try:
+            history = json.loads(history_param)
+            # Append current user message if not already in history
+            if user and (not history or history[-1].get('content') != user):
+                history.append({'role': 'user', 'content': user})
+        except Exception:
+            history = [{'role': 'user', 'content': user}] if user else []
+    else:
+        history = [{'role': 'user', 'content': user}] if user else []
+    
+    # Determine if we have previous conversation context (more than just the current message)
+    has_context = len(history) > 1
 
     def generate():
         # Stream tokens from both models concurrently and process deltas as they arrive.
@@ -193,9 +235,24 @@ def api_chat_stream():
                     q.put({'who': who, 'type': 'error', 'error': 'no local LLM configured'})
                     done[who] = True
                     return
-                # build messages similar to other endpoints
-                sys_prompt = llm_api.local_llm.SYSTEM_PROMPT if hasattr(llm_api.local_llm, 'SYSTEM_PROMPT') else ''
-                msgs = [{'role': 'system', 'content': sys_prompt}] + (history[-getattr(llm_api.local_llm, 'MAX_HISTORY', 8):] if history else [])
+                # build messages with dynamic system prompt based on filler mode
+                with SETTINGS_LOCK:
+                    filler_mode = SETTINGS.get('filler_mode', 'auto')
+                sys_prompt = llm_api.local_llm.get_system_prompt(filler_mode) if hasattr(llm_api.local_llm, 'get_system_prompt') else (llm_api.local_llm.SYSTEM_PROMPT if hasattr(llm_api.local_llm, 'SYSTEM_PROMPT') else '')
+                
+                # Build messages with explicit context marking if history exists
+                if has_context and len(history) > 1:
+                    # Add context marker after system prompt
+                    context_msgs = history[-getattr(llm_api.local_llm, 'MAX_HISTORY', 8):-1]  # All but current message
+                    current_msg = history[-1:]  # Just the current message
+                    
+                    # Create enhanced system prompt with context indicator
+                    enhanced_prompt = sys_prompt + "\n\nNote: The following conversation history is provided for context. The user's current request is at the end."
+                    
+                    msgs = [{'role': 'system', 'content': enhanced_prompt}] + context_msgs + current_msg
+                else:
+                    msgs = [{'role': 'system', 'content': sys_prompt}] + (history[-getattr(llm_api.local_llm, 'MAX_HISTORY', 8):] if history else [])
+                
                 payload = {'model': getattr(llm_api.local_llm, 'MODEL', None) or 'local', 'messages': msgs, 'stream': True, 'temperature': 0}
                 url = getattr(llm_api.local_llm, 'LLM_SERVER_URL', None)
                 if not url:
@@ -244,9 +301,27 @@ def api_chat_stream():
                     q.put({'who': who, 'type': 'error', 'error': 'OPENAI_API_KEY not set'})
                     done[who] = True
                     return
-                # construct messages using llm_api logic
-                sys_prompt = llm_api.llm_helper.SYSTEM_PROMPT if getattr(llm_api, 'llm_helper', None) and hasattr(llm_api.llm_helper, 'SYSTEM_PROMPT') else (llm_api.local_llm.SYSTEM_PROMPT if getattr(llm_api, 'local_llm', None) and hasattr(llm_api.local_llm, 'SYSTEM_PROMPT') else '')
-                msgs = [{'role': 'system', 'content': sys_prompt}] + (history[-(llm_api.llm_helper.MAX_HISTORY if getattr(llm_api, 'llm_helper', None) and hasattr(llm_api.llm_helper, 'MAX_HISTORY') else (llm_api.local_llm.MAX_HISTORY if getattr(llm_api, 'local_llm', None) and hasattr(llm_api.local_llm, 'MAX_HISTORY') else 8)):] if history else [])
+                # construct messages with dynamic system prompt based on filler mode
+                with SETTINGS_LOCK:
+                    filler_mode = SETTINGS.get('filler_mode', 'auto')
+                llm_module = llm_api.llm_helper if getattr(llm_api, 'llm_helper', None) else llm_api.local_llm
+                sys_prompt = llm_module.get_system_prompt(filler_mode) if hasattr(llm_module, 'get_system_prompt') else (llm_module.SYSTEM_PROMPT if hasattr(llm_module, 'SYSTEM_PROMPT') else '')
+                
+                # Build messages with explicit context marking if history exists
+                max_hist = llm_api.llm_helper.MAX_HISTORY if getattr(llm_api, 'llm_helper', None) and hasattr(llm_api.llm_helper, 'MAX_HISTORY') else (llm_api.local_llm.MAX_HISTORY if getattr(llm_api, 'local_llm', None) and hasattr(llm_api.local_llm, 'MAX_HISTORY') else 8)
+                
+                if has_context and len(history) > 1:
+                    # Add context marker after system prompt
+                    context_msgs = history[-max_hist:-1]  # All but current message
+                    current_msg = history[-1:]  # Just the current message
+                    
+                    # Create enhanced system prompt with context indicator
+                    enhanced_prompt = sys_prompt + "\n\nNote: The following conversation history is provided for context. The user's current request is at the end."
+                    
+                    msgs = [{'role': 'system', 'content': enhanced_prompt}] + context_msgs + current_msg
+                else:
+                    msgs = [{'role': 'system', 'content': sys_prompt}] + (history[-max_hist:] if history else [])
+                
                 payload = {'model': 'gpt-5.2', 'messages': msgs, 'temperature': 0, 'stream': True}
                 headers = {'Authorization': f'Bearer {llm_api.OPENAI_KEY}', 'Content-Type': 'application/json'}
                 resp = requests.post(llm_api.OPENAI_URL, json=payload, headers=headers, timeout=(5, 60), stream=True)
@@ -367,9 +442,44 @@ def api_chat_stream():
                                         try:
                                             t0 = time.time()
                                             last_text = history[-1]['content'] if history else (user or '')
-                                            res = llm_api.apply_toolcall(parsed_obj, target=target_who, last_user_text=last_text)
-                                            t1 = time.time()
-                                            q.put({'who': target_who, 'type': 'tool_result', 'result': res, 'parsed': parsed_obj, 'ms': int((t1-t0)*1000), 'stream_id': sid})
+                                            
+                                            # Check for filler and emit it immediately before executing tool
+                                            filler = parsed_obj.get('filler', '').strip()
+                                            if filler:
+                                                q.put({'who': target_who, 'type': 'delta', 'text': filler, 'ts': int((time.time()-t0)*1000), 'stream_id': sid, 'is_filler': True})
+                                            
+                                            # Special handling for weather tool - stream LLM summary instead of returning raw data
+                                            if parsed_obj.get('tool') == 'get_weather':
+                                                try:
+                                                    # First emit the tool call event
+                                                    q.put({'who': target_who, 'type': 'tool_call', 'parsed': parsed_obj, 'stream_id': sid})
+                                                    
+                                                    # Get weather data
+                                                    weather_data = weather.get_current_weather()
+                                                    
+                                                    if weather_data.get('ok'):
+                                                        # Stream the weather summary from dedicated LLM
+                                                        accumulated = ''
+                                                        for token in weather.stream_weather_summary(weather_data, last_text):
+                                                            accumulated += token
+                                                            q.put({'who': target_who, 'type': 'delta', 'text': token, 'ts': int((time.time()-t0)*1000), 'stream_id': sid})
+                                                        
+                                                        # Send completion marker with empty applied to prevent re-summarization
+                                                        # (content was already streamed as deltas and processed by TTS)
+                                                        t1 = time.time()
+                                                        result_summary = {'ok': True, 'message': accumulated, 'weather': weather_data}
+                                                        q.put({'who': target_who, 'type': 'tool_result', 'result': result_summary, 'parsed': parsed_obj, 'ms': int((t1-t0)*1000), 'stream_id': sid})
+                                                    else:
+                                                        # Weather fetch failed, return error
+                                                        t1 = time.time()
+                                                        q.put({'who': target_who, 'type': 'tool_result', 'result': weather_data, 'parsed': parsed_obj, 'ms': int((t1-t0)*1000), 'stream_id': sid})
+                                                except Exception as e:
+                                                    q.put({'who': target_who, 'type': 'tool_result', 'result': {'ok': False, 'error': f'Weather streaming error: {str(e)}'}, 'parsed': parsed_obj, 'ms': 0, 'stream_id': sid})
+                                            else:
+                                                # Standard tool call handling for non-weather tools
+                                                res = llm_api.apply_toolcall(parsed_obj, target=target_who, last_user_text=last_text)
+                                                t1 = time.time()
+                                                q.put({'who': target_who, 'type': 'tool_result', 'result': res, 'parsed': parsed_obj, 'ms': int((t1-t0)*1000), 'stream_id': sid})
                                         except Exception as e:
                                             try:
                                                 q.put({'who': target_who, 'type': 'tool_result', 'result': {'ok': False, 'error': str(e)}, 'parsed': parsed_obj, 'ms': 0, 'stream_id': sid})
@@ -408,10 +518,83 @@ def api_chat_stream():
             if item.get('type') == 'delta':
                 # emit original model_text fragment for backwards compatibility
                 delta = str(item.get('text') or '')
+                is_filler = item.get('is_filler', False)
                 try:
                     yield f"event: model_text\ndata: {json.dumps({'model': who, 'index': None, 'text': delta, 'ms': item.get('ts'), 'stream_id': item.get('stream_id') or stream_id})}\n\n"
                 except Exception:
                     pass
+                
+                # For filler responses, bypass toolcall processing and treat as complete sentence
+                # Queue immediately for TTS to ensure it plays before tool results
+                if is_filler:
+                    # Ensure filler ends with period for proper sentence detection
+                    filler_text = delta.strip()
+                    if not filler_text.endswith(('.', '!', '?')):
+                        filler_text += '.'
+                    
+                    # Directly queue filler for TTS without buffering
+                    run_id = run_ids.get(who) or (uuid.uuid4().hex)
+                    run_ids[who] = run_id
+                    idx = chunk_counters.get(who, 0)
+                    chunk_counters[who] = idx + 1
+
+                    def _synth_filler(s=filler_text, w=who, rid=run_id, idx=idx, sid=stream_id):
+                        tts_start = time.perf_counter()
+                        if w == 'cloud':
+                            if not tts.cloud_tts_provider:
+                                raise RuntimeError('cloud TTS provider not configured')
+                            audio = tts.cloud_tts_provider.synthesize_speech(s, None)
+                            src = 'cloud'
+                        else:
+                            if not tts.local_tts_provider:
+                                raise RuntimeError('local TTS provider not configured')
+                            audio = tts.local_tts_provider.synthesize_speech(s, None)
+                            src = 'local'
+                        tts_end = time.perf_counter()
+                        tts_ms = (tts_end - tts_start) * 1000.0
+                        try:
+                            path = tts._save_chunk_audio(rid, idx, src, audio)
+                            with tts._TTS_JOB_LOCK:
+                                job = tts.JOBS.get(rid) or {}
+                                job.setdefault('chunks', []).append(path)
+                                tts.JOBS[rid] = job
+                        except Exception:
+                            pass
+                        return {'who': w, 'run_id': rid, 'index': idx, 'audio': bytes(audio), 'source': src, 'tts_ms': tts_ms, 'text': s, 'stream_id': sid}
+
+                    # Submit filler synthesis with high priority (process immediately)
+                    fut = synth_executor.submit(_synth_filler)
+                    
+                    def _on_filler_done(futobj, w=who):
+                        try:
+                            res = None
+                            try:
+                                res = futobj.result()
+                            except Exception as e:
+                                q.put({'who': w, 'type': 'synth_error', 'error': str(e), 'stream_id': stream_id})
+                                return
+                            if res:
+                                try:
+                                    with synth_lock:
+                                        try:
+                                            pending_futures.remove(futobj)
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                                q.put({'who': w, 'type': 'synth', 'res': res, 'stream_id': stream_id})
+                        except Exception as e:
+                            pass
+                    
+                    fut.add_done_callback(_on_filler_done)
+                    with synth_lock:
+                        pending_futures.append(fut)
+                    
+                    # Don't add filler to buffer - it's been handled directly
+                    # Skip to next queue item
+                    continue
+                
+                # Normal delta processing (not a filler)
                 # process delta for toolcall JSON and append spoken text only
                 try:
                     speak_delta = _process_toolcall_chunk(who, delta)
@@ -419,6 +602,7 @@ def api_chat_stream():
                     speak_delta = delta
                 if speak_delta:
                     buffers[who] += speak_delta
+                
                 # check for sentences in buffer
                 sentences, remainder = tts._extract_sentences(buffers[who])
                 if sentences:
@@ -484,11 +668,11 @@ def api_chat_stream():
                         fut.add_done_callback(_on_done)
                         with synth_lock:
                             pending_futures.append(fut)
-                        # notify clients that a TTS task was queued for this stream
-                        try:
-                            yield f"event: tts_queued\ndata: {json.dumps({'model': who, 'stream_id': stream_id, 'index': idx})}\n\n"
-                        except Exception:
-                            pass
+                    # notify clients that a TTS task was queued for this stream
+                    try:
+                        yield f"event: tts_queued\ndata: {json.dumps({'model': who, 'stream_id': stream_id, 'index': idx})}\n\n"
+                    except Exception:
+                        pass
                     buffers[who] = remainder
 
             # synth completions are pushed into the queue by future callbacks
@@ -535,12 +719,26 @@ def api_chat_stream():
                     pass
                 continue
 
+            if item.get('type') == 'tool_call':
+                try:
+                    who = item.get('who')
+                    parsed = item.get('parsed')
+                    payload = {'model': who, 'tool': parsed.get('tool'), 'params': parsed, 'stream_id': item.get('stream_id')}
+                    yield f"event: tool_call\ndata: {json.dumps(payload, default=str)}\n\n"
+                except Exception:
+                    pass
+                continue
+
             if item.get('type') == 'tool_result':
                 try:
                     who = item.get('who')
                     res = item.get('result') or {}
                     parsed = item.get('parsed')
-                    payload = {'model': who, 'ok': bool(res.get('ok', True)), 'content': None, 'parsed': parsed, 'applied': res, 'ms': item.get('ms'), 'stream_id': item.get('stream_id')}
+                    # For streaming tools like weather, include the accumulated message as content
+                    content = res.get('message', None)
+                    # If weather was streamed (has message), use empty applied to prevent re-summarization in frontend
+                    applied = {} if res.get('message') else res
+                    payload = {'model': who, 'ok': bool(res.get('ok', True)), 'content': content, 'parsed': parsed, 'applied': applied, 'ms': item.get('ms'), 'stream_id': item.get('stream_id')}
                     yield f"event: model\ndata: {json.dumps(payload, default=str)}\n\n"
                     try:
                         # if tool changed state, publish state event
@@ -561,6 +759,63 @@ def api_chat_stream():
                     yield f"event: model\ndata: {json.dumps(payload, default=str)}\n\n"
                 except Exception:
                     pass
+                
+                # Flush any remaining buffered text for this model
+                # This ensures incomplete sentences are still synthesized
+                if who in buffers and buffers[who].strip():
+                    remaining_text = buffers[who].strip()
+                    run_id = run_ids.get(who) or (uuid.uuid4().hex)
+                    run_ids[who] = run_id
+                    idx = chunk_counters.get(who, 0)
+                    chunk_counters[who] = idx + 1
+                    
+                    def _synth_final(s=remaining_text, w=who, rid=run_id, idx=idx, sid=stream_id):
+                        tts_start = time.perf_counter()
+                        if w == 'cloud':
+                            if not tts.cloud_tts_provider:
+                                raise RuntimeError('cloud TTS provider not configured')
+                            audio = tts.cloud_tts_provider.synthesize_speech(s, None)
+                            src = 'cloud'
+                        else:
+                            if not tts.local_tts_provider:
+                                raise RuntimeError('local TTS provider not configured')
+                            audio = tts.local_tts_provider.synthesize_speech(s, None)
+                            src = 'local'
+                        tts_end = time.perf_counter()
+                        tts_ms = (tts_end - tts_start) * 1000.0
+                        try:
+                            path = tts._save_chunk_audio(rid, idx, src, audio)
+                            with tts._TTS_JOB_LOCK:
+                                job = tts.JOBS.get(rid) or {}
+                                job.setdefault('chunks', []).append(path)
+                                tts.JOBS[rid] = job
+                        except Exception:
+                            pass
+                        return {'who': w, 'run_id': rid, 'index': idx, 'audio': bytes(audio), 'source': src, 'tts_ms': tts_ms, 'text': s, 'stream_id': sid}
+                    
+                    fut = synth_executor.submit(_synth_final)
+                    
+                    def _on_final_done(futobj, w=who):
+                        try:
+                            res = futobj.result()
+                            if res:
+                                try:
+                                    with synth_lock:
+                                        try:
+                                            pending_futures.remove(futobj)
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                                q.put({'who': w, 'type': 'synth', 'res': res, 'stream_id': stream_id})
+                        except Exception:
+                            pass
+                    
+                    fut.add_done_callback(_on_final_done)
+                    with synth_lock:
+                        pending_futures.append(fut)
+                    
+                    buffers[who] = ''  # Clear the buffer after flushing
 
         # ensure workers have finished and clean up executor
         try:

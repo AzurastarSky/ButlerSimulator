@@ -18,12 +18,21 @@ let CLOUD_ROOMS = {};
 
 const elPrompt = document.getElementById('prompt-input');
 const elPromptBtn = document.getElementById('prompt-send');
+const elClearHistory = document.getElementById('clear-history');
+const elFillerToggle = document.getElementById('filler-toggle');
+const elFillerMode = document.getElementById('filler-mode');
 const recStartBtn = document.getElementById('rec-start');
 const recStopBtn  = document.getElementById('rec-stop');
 const sttStatusEl = document.getElementById('stt-status');
 const sttTranscriptEl = document.getElementById('stt-transcript');
 const playerLocal = document.getElementById('player-local');
 const playerCloud = document.getElementById('player-cloud');
+
+// Conversation history: maintain last 4 messages (2 user + 2 assistant turns)
+let conversationHistory = [];
+
+// Filler mode state
+let currentFillerMode = 'auto'; // can be 'on', 'off', or 'auto'
 
 // Simple per-model playback queues for SSE audio chunks
 const _playQueues = { local: [], cloud: [] };
@@ -295,6 +304,13 @@ function _metricsSet(who, key, val){
   }
   if (!mid) return;
   try{
+    // If TTFA is already set for this request, don't overwrite it
+    const currentText = mid.textContent || '';
+    if (currentText.includes('TTFA:') && currentText.includes('ms')) {
+      console.debug(`[TTFA] Skipping update for ${who} - already set to ${currentText}`);
+      return; // Don't overwrite existing TTFA value
+    }
+    
     if (val === null || typeof val === 'undefined' || val === ''){
       mid.textContent = '';
     } else {
@@ -305,12 +321,27 @@ function _metricsSet(who, key, val){
 
 // Prompt handling + SSE
 function openRaceSSE(text){
-  const url = `/api/chat/stream?user=${encodeURIComponent(text)}`;
+  // Build URL with user message and conversation history
+  let url = `/api/chat/stream?user=${encodeURIComponent(text)}`;
+  if (conversationHistory.length > 0) {
+    // Send last 4 messages (2 turns) as context
+    url += `&history=${encodeURIComponent(JSON.stringify(conversationHistory))}`;
+  }
   const promptStart = Date.now();
+  
+  // Clear TTFA metrics for new request
+  try {
+    const localMetrics = document.getElementById('metrics-local');
+    const cloudMetrics = document.getElementById('metrics-cloud');
+    if (localMetrics) localMetrics.textContent = '';
+    if (cloudMetrics) cloudMetrics.textContent = '';
+  } catch(e) {/*ignore*/}
+  
   const es = new EventSource(url);
   let esStreamId = null;
   let sawSentence = false;
   let firstAudioReceived = { local: false, cloud: false };
+  let assistantResponses = { local: '', cloud: '' };
   ensureRespEl('local').textContent = 'waiting...';
   ensureRespEl('cloud').textContent = 'waiting...';
   es.addEventListener('model', async (ev) => {
@@ -321,8 +352,11 @@ function openRaceSSE(text){
       const who = data.model; // 'local' or 'cloud'
       const ms = data.ms;
       const content = data.content || '';
-      // Blurb box: only show assistant/tool content (no timings)
-      ensureRespEl(who).textContent = content.replace(/\n/g,' ');
+      // Track assistant response for history
+      if (content) assistantResponses[who] = content;
+      // Blurb box: only show assistant/tool content (no timings), remove asterisks
+      const displayContent = content.replace(/\*+/g, '').replace(/\n/g,' ');
+      ensureRespEl(who).textContent = displayContent;
       // Metrics block below: persist LLM timing
       try{ _metricsSet(who, 'llm', ms); }catch(e){}
       await fetchStateFor(who);
@@ -393,8 +427,10 @@ function openRaceSSE(text){
           const who = obj.model || 'local';
           const text = obj.text || '';
           if (!text) return;
+          // Remove asterisks from streaming text
+          const cleanText = text.replace(/\*/g, '');
           const el = ensureRespEl(who);
-          try{ el.textContent = (el.textContent || '') + text; }catch(e){}
+          try{ el.textContent = (el.textContent || '') + cleanText; }catch(e){}
         }catch(e){ console.warn('model_text parse error', e); }
       });
 
@@ -426,7 +462,21 @@ function openRaceSSE(text){
         }catch(e){ console.warn('sentence parse error', e); }
       });
 
-      es.addEventListener('error', (e)=>{ es.close(); });
+      es.addEventListener('error', (e)=>{ 
+        es.close(); 
+        // Update conversation history when stream ends
+        // Add user message
+        conversationHistory.push({ role: 'user', content: text });
+        // Add assistant response (prefer cloud if available, otherwise local)
+        const assistantReply = assistantResponses.cloud || assistantResponses.local || '';
+        if (assistantReply) {
+          conversationHistory.push({ role: 'assistant', content: assistantReply });
+        }
+        // Keep only last 4 messages (2 turns)
+        if (conversationHistory.length > 4) {
+          conversationHistory = conversationHistory.slice(-4);
+        }
+      });
   return es;
 }
 
@@ -434,6 +484,66 @@ elPromptBtn.addEventListener('click', () => {
   const text = elPrompt.value.trim();
   if (!text) return;
   openRaceSSE(text);
+  elPrompt.value = ''; // Clear input after sending
+});
+
+// Clear conversation history
+elClearHistory.addEventListener('click', () => {
+  conversationHistory = [];
+  console.log('Conversation history cleared');
+  // Visual feedback
+  const btn = elClearHistory;
+  const originalText = btn.textContent;
+  btn.textContent = 'Cleared!';
+  setTimeout(() => { btn.textContent = originalText; }, 1000);
+});
+
+// Toggle filler mode: auto -> on -> off -> auto
+elFillerToggle.addEventListener('click', async () => {
+  const modes = ['auto', 'on', 'off'];
+  const currentIndex = modes.indexOf(currentFillerMode);
+  const nextMode = modes[(currentIndex + 1) % modes.length];
+  
+  try {
+    const response = await fetch('/api/settings/filler-mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: nextMode })
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      currentFillerMode = data.filler_mode;
+      elFillerMode.textContent = currentFillerMode.toUpperCase();
+      console.log('Filler mode updated to:', currentFillerMode);
+    } else {
+      console.error('Failed to update filler mode');
+    }
+  } catch (error) {
+    console.error('Error updating filler mode:', error);
+  }
+});
+
+// Load current filler mode on startup
+async function loadFillerMode() {
+  try {
+    const response = await fetch('/api/settings');
+    if (response.ok) {
+      const data = await response.json();
+      currentFillerMode = data.filler_mode || 'auto';
+      elFillerMode.textContent = currentFillerMode.toUpperCase();
+      console.log('Loaded filler mode:', currentFillerMode);
+    }
+  } catch (error) {
+    console.error('Error loading settings:', error);
+  }
+}
+
+// Allow Enter key to send prompt
+elPrompt.addEventListener('keypress', (e) => {
+  if (e.key === 'Enter') {
+    elPromptBtn.click();
+  }
 });
 
 // ---------- TTS helpers (used to auto-play LLM responses) ----------
@@ -766,11 +876,13 @@ async function streamSummarizeAndPlay(text, applied, prefer='cloud', who='local'
           const obj = JSON.parse(data);
           const text = obj.text || '';
           if (!text) return;
+          // Remove asterisks from streaming text
+          const cleanText = text.replace(/\*/g, '');
           const el = ensureRespEl(who);
           try{ 
             const current = el.textContent || '';
             const separator = current && !current.endsWith(' ') && !current.endsWith('\n') ? '  ' : '';
-            el.textContent = current + separator + text;
+            el.textContent = current + separator + cleanText;
           }catch(e){}
         }catch(e){ console.warn('model_text parse error (summarize_stream)', e); }
       } else if (evt === 'tts_queued'){
@@ -828,6 +940,8 @@ function sanitizeForTTS(s){
     out = out.replace(/\"?tool\"?\s*:\s*\"[^\"]*\"\s*,?/gi, '');
     // remove any leading 'tool:...' tokens on their own lines
     out = out.split('\n').filter(line => !/^\s*\"?tool\"?\s*:/i.test(line)).join('\n');
+    // remove markdown asterisks (bold and italic formatting)
+    out = out.replace(/\*+/g, '');
     // collapse multiple whitespace and trim
     out = out.replace(/\s+/g,' ').trim();
     return out;
@@ -1081,6 +1195,9 @@ recStopBtn.addEventListener('click', ()=>{
 fetchStateFor('local').catch(e=>{ console.error('fetchStateFor local failed', e); if(sttTranscriptEl) sttTranscriptEl.textContent = 'State load error'; });
 fetchStateFor('cloud').catch(e=>{ console.error('fetchStateFor cloud failed', e); if(sttTranscriptEl) sttTranscriptEl.textContent = 'State load error'; });
 // main thermostat removed; no global state fetch required
+
+// Load filler mode setting
+loadFillerMode();
 
 // Subscribe to server-sent events for live state updates
 try{
