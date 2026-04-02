@@ -57,9 +57,12 @@ def get_system_prompt(filler_mode='auto'):
     # else 'off' - no filler instruction or examples
     
     return f"""
-You are Butler. You control devices using JSON tool calls.
+You are Butler, a helpful British AI assistant.
 
-TOOL FORMAT:
+WHEN TO USE JSON: Only for device control, state queries, or weather questions.
+WHEN TO USE PLAIN TEXT: For greetings, casual conversation, questions about yourself, or anything not related to devices/weather.
+
+JSON TOOL FORMAT (use ONLY when controlling devices or checking weather/state):
 Device control: {{"tool":"manage_device","room":"all","device":"light","action":"turn_on"{light_on_filler}}}
 State query: {{"tool":"query_state","room":"house","device":"thermostat"}}
 Weather: {{"tool":"get_weather"{weather_filler}}}{filler_instruction}
@@ -80,9 +83,15 @@ quite/pretty/fairly = 2
 very/really/too = 3
 extremely/way too = 4
 
-WEATHER QUESTIONS include: "What's the weather?", "Do I need a jacket?", "Can I wear shorts?", "Should I bring an umbrella?", "Is it nice out?"
+WEATHER QUESTIONS include: "What's the weather?", "Do I need a jacket?", "Can I wear shorts?", "Should I bring an umbrella?", "Is it nice out?", "Can I go for a run?", "Good weather for running?"
 
 EXAMPLES:
+
+User: Hello!
+Hello! How can I help you today?
+
+User: How are you?
+I'm doing well, thank you! How can I assist you?
 
 User: I am a bit cold
 {{"tool":"manage_device","room":"all","device":"thermostat","action":"increase","value":"1"{thermo_increase_filler}}}
@@ -102,7 +111,11 @@ User: Turn on the lights
 User: Do I need a jacket?
 {{"tool":"get_weather"{weather_filler}}}
 
-For non-device/weather requests, respond naturally in plain text without JSON.
+User: Should I go for a run today?
+{{"tool":"get_weather"{weather_filler}}}
+
+User: Is it good weather for running?
+{{"tool":"get_weather"{weather_filler}}}
 """
 
 
@@ -126,31 +139,6 @@ INTENSITY_STEPS: List[Tuple[re.Pattern[str], float]] = [
 
 BY_NUMBER = re.compile(r"\bby\s*(\d{1,2})(?:\s*degrees|\s*°)?\b", re.I)
 TO_NUMBER = re.compile(r"\bto\s*(\d{1,2})(?:\s*degrees|\s*°)?\b", re.I)
-
-HOT_WORDS = {
-    "hot",
-    "warm",
-    "boiling",
-    "roasting",
-    "sweltering",
-    "stuffy",
-    "sweaty",
-    "too hot",
-    "very hot",
-    "way too hot",
-}
-
-COLD_WORDS = {
-    "cold",
-    "chilly",
-    "freezing",
-    "nippy",
-    "drafty",
-    "too cold",
-    "very cold",
-    "way too cold",
-}
-
 
 # debug print helper removed (unused) — use logging if needed
 
@@ -321,18 +309,6 @@ def infer_thermo_target(user_text: str) -> Optional[float]:
             return float(match.group(1))
         except (TypeError, ValueError):
             pass
-    return None
-
-
-def infer_comfort_direction(user_text: str) -> Optional[str]:
-    text = (user_text or "").lower()
-
-    if any(word in text for word in HOT_WORDS):
-        return "decrease"
-
-    if any(word in text for word in COLD_WORDS):
-        return "increase"
-
     return None
 
 

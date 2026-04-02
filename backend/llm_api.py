@@ -1,5 +1,4 @@
 import os
-import time
 import json
 import requests
 from typing import List
@@ -46,14 +45,12 @@ def post_chat_openai(history: List[dict]) -> dict:
     sys_prompt = None
     if llm_helper and hasattr(llm_helper, 'SYSTEM_PROMPT'):
         sys_prompt = llm_helper.SYSTEM_PROMPT
-    elif local_llm and hasattr(local_llm, 'SYSTEM_PROMPT'):
-        sys_prompt = local_llm.SYSTEM_PROMPT
     else:
         sys_prompt = "You are Butler. Output JSON only as specified by the assistant's device-control schema."
 
     messages = [{"role": "system", "content": sys_prompt}]
     try:
-        max_hist = llm_helper.MAX_HISTORY if llm_helper and hasattr(llm_helper, 'MAX_HISTORY') else (local_llm.MAX_HISTORY if local_llm and hasattr(local_llm, 'MAX_HISTORY') else None)
+        max_hist = llm_helper.MAX_HISTORY if llm_helper and hasattr(llm_helper, 'MAX_HISTORY') else 8
         if max_hist and isinstance(max_hist, int):
             messages += history[-max_hist:]
         else:
@@ -143,7 +140,8 @@ def apply_toolcall(js: dict, target: str = 'local', last_user_text: str = None) 
             return {"ok": False, "error": f"Unknown thermostat action: {action}"}
 
         if action in {"increase", "decrease"} and (value is None):
-            if local_llm and hasattr(local_llm, 'infer_thermo_step') and last_user_text:
+            # Only infer step for local target, not cloud
+            if target == 'local' and local_llm and hasattr(local_llm, 'infer_thermo_step') and last_user_text:
                 inferred = local_llm.infer_thermo_step(last_user_text)
                 if inferred is not None:
                     value = inferred

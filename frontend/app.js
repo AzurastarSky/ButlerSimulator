@@ -18,7 +18,6 @@ let CLOUD_ROOMS = {};
 
 const elPrompt = document.getElementById('prompt-input');
 const elPromptBtn = document.getElementById('prompt-send');
-const elClearHistory = document.getElementById('clear-history');
 const elFillerToggle = document.getElementById('filler-toggle');
 const elFillerMode = document.getElementById('filler-mode');
 const recStartBtn = document.getElementById('rec-start');
@@ -28,8 +27,11 @@ const sttTranscriptEl = document.getElementById('stt-transcript');
 const playerLocal = document.getElementById('player-local');
 const playerCloud = document.getElementById('player-cloud');
 
-// Conversation history: maintain last 4 messages (2 user + 2 assistant turns)
-let conversationHistory = [];
+// Separate conversation histories for local and cloud models
+// Keep last 10 messages (5 turns) for better context while preventing quality degradation
+const MAX_HISTORY_MESSAGES = 10;
+let conversationHistoryLocal = [];
+let conversationHistoryCloud = [];
 
 // Filler mode state
 let currentFillerMode = 'auto'; // can be 'on', 'off', or 'auto'
@@ -321,11 +323,15 @@ function _metricsSet(who, key, val){
 
 // Prompt handling + SSE
 function openRaceSSE(text){
-  // Build URL with user message and conversation history
+  // Build URL with user message and separate histories for local and cloud
   let url = `/api/chat/stream?user=${encodeURIComponent(text)}`;
-  if (conversationHistory.length > 0) {
-    // Send last 4 messages (2 turns) as context
-    url += `&history=${encodeURIComponent(JSON.stringify(conversationHistory))}`;
+  // Send separate histories for each model
+  if (conversationHistoryLocal.length > 0 || conversationHistoryCloud.length > 0) {
+    const historyPayload = {
+      local: conversationHistoryLocal,
+      cloud: conversationHistoryCloud
+    };
+    url += `&history=${encodeURIComponent(JSON.stringify(historyPayload))}`;
   }
   const promptStart = Date.now();
   
@@ -464,17 +470,24 @@ function openRaceSSE(text){
 
       es.addEventListener('error', (e)=>{ 
         es.close(); 
-        // Update conversation history when stream ends
-        // Add user message
-        conversationHistory.push({ role: 'user', content: text });
-        // Add assistant response (prefer cloud if available, otherwise local)
-        const assistantReply = assistantResponses.cloud || assistantResponses.local || '';
-        if (assistantReply) {
-          conversationHistory.push({ role: 'assistant', content: assistantReply });
+        // Update separate conversation histories for each model
+        // Local model history
+        if (assistantResponses.local) {
+          conversationHistoryLocal.push({ role: 'user', content: text });
+          conversationHistoryLocal.push({ role: 'assistant', content: assistantResponses.local });
+          // Auto-trim to last MAX_HISTORY_MESSAGES
+          if (conversationHistoryLocal.length > MAX_HISTORY_MESSAGES) {
+            conversationHistoryLocal = conversationHistoryLocal.slice(-MAX_HISTORY_MESSAGES);
+          }
         }
-        // Keep only last 4 messages (2 turns)
-        if (conversationHistory.length > 4) {
-          conversationHistory = conversationHistory.slice(-4);
+        // Cloud model history
+        if (assistantResponses.cloud) {
+          conversationHistoryCloud.push({ role: 'user', content: text });
+          conversationHistoryCloud.push({ role: 'assistant', content: assistantResponses.cloud });
+          // Auto-trim to last MAX_HISTORY_MESSAGES
+          if (conversationHistoryCloud.length > MAX_HISTORY_MESSAGES) {
+            conversationHistoryCloud = conversationHistoryCloud.slice(-MAX_HISTORY_MESSAGES);
+          }
         }
       });
   return es;
@@ -485,17 +498,6 @@ elPromptBtn.addEventListener('click', () => {
   if (!text) return;
   openRaceSSE(text);
   elPrompt.value = ''; // Clear input after sending
-});
-
-// Clear conversation history
-elClearHistory.addEventListener('click', () => {
-  conversationHistory = [];
-  console.log('Conversation history cleared');
-  // Visual feedback
-  const btn = elClearHistory;
-  const originalText = btn.textContent;
-  btn.textContent = 'Cleared!';
-  setTimeout(() => { btn.textContent = originalText; }, 1000);
 });
 
 // Toggle filler mode: auto -> on -> off -> auto
@@ -547,58 +549,6 @@ elPrompt.addEventListener('keypress', (e) => {
 });
 
 // ---------- TTS helpers (used to auto-play LLM responses) ----------
-async function startTTS(text, voice){
-  const body = { text };
-  if (voice) body.voice = voice;
-  const res = await fetch('/api/tts', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-  if (!res.ok) {
-    const j = await res.json().catch(()=>({}));
-    throw new Error(j.error || res.statusText || 'TTS start failed');
-  }
-  return await res.json();
-}
-
-// Poll TTS job status and render timing block above the thermostat target
-async function monitorTTSStatus(job_id, who){
-  const deadline = Date.now() + 30000;
-  while(Date.now() < deadline){
-    try{
-      const resp = await fetch(`/api/tts/status?job_id=${encodeURIComponent(job_id)}`);
-      if (!resp.ok) { break; }
-      const j = await resp.json().catch(()=>null);
-      if (!j || !j.job) { break; }
-      const t = j.job.timings || {};
-      const srcTiming = t[who] && typeof t[who].duration_ms !== 'undefined' ? t[who].duration_ms : null;
-      // Persist the TTS timing into the matching persistent metrics block only
-      try{ _metricsSet(who, 'tts', srcTiming); }catch(e){}
-      // stop early if both providers finished
-      const s = j.job.status || {};
-      if ((s.local && s.local !== 'pending') && (s.cloud && s.cloud !== 'pending')) break;
-    }catch(e){ console.warn('monitorTTSStatus', e); }
-    await new Promise(r=>setTimeout(r, 400));
-  }
-}
-
-async function fetchTTSStreamAndPlay(job_id, playerEl){
-  const streamUrl = `/api/tts/stream?job_id=${encodeURIComponent(job_id)}`;
-  const resp = await fetch(streamUrl);
-  if (!resp.ok) {
-    const j = await resp.json().catch(()=>null);
-    throw new Error((j && j.error) ? j.error : resp.statusText);
-  }
-  const ct = resp.headers.get('Content-Type') || '';
-  const source = resp.headers.get('X-TTS-Source') || 'unknown';
-  const ab = await resp.arrayBuffer();
-  const blob = new Blob([ab], { type: ct || 'audio/mpeg' });
-  const url = URL.createObjectURL(blob);
-  if (playerEl){
-    playerEl.src = url;
-    try{ await playerEl.play(); }catch(e){}
-  }
-  return source;
-}
-
-
 // Stream per-sentence TTS via POST streaming and play incrementally
 async function streamTtsSentencesViaFetch(text, source='local', voice=undefined, playerEl=null, ttfaStart=null){
   // Creates a queue of audio blobs and plays them sequentially as they arrive.

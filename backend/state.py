@@ -3,8 +3,6 @@ import threading
 import copy
 import json
 import queue
-from pathlib import Path
-import os
 
 # Import helpers
 try:

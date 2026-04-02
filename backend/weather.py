@@ -204,13 +204,14 @@ def format_weather_for_llm(weather_data: Dict[str, Any]) -> str:
     return summary
 
 
-def stream_weather_summary(weather_data: Dict[str, Any], user_context: str = "") -> Generator[str, None, None]:
+def stream_weather_summary(weather_data: Dict[str, Any], user_context: str = "", source: str = "local") -> Generator[str, None, None]:
     """
     Stream a natural language weather summary using a dedicated LLM call.
     
     Args:
         weather_data: Weather data dict from get_current_weather()
         user_context: Optional user message for context
+        source: 'local' for local LLM, 'cloud' for OpenAI (default: 'local')
     
     Yields:
         Token deltas from the LLM streaming response
@@ -249,16 +250,47 @@ def stream_weather_summary(weather_data: Dict[str, Any], user_context: str = "")
         {"role": "user", "content": user_msg}
     ]
     
-    payload = {
-        "model": MODEL,
-        "messages": messages,
-        "stream": True,
-        "temperature": 0.7,  # Slightly higher for more natural variety
-        "max_tokens": 150
-    }
+    # Use OpenAI for cloud source, local LLM otherwise
+    if source == "cloud":
+        # Use OpenAI API
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key:
+            error_msg = "OpenAI API key not configured for cloud weather summary."
+            for char in error_msg:
+                yield char
+            return
+        
+        payload = {
+            "model": "gpt-4o-mini",  # Use faster/cheaper model for weather summaries
+            "messages": messages,
+            "stream": True,
+            "temperature": 0.7,
+            "max_tokens": 150
+        }
+        
+        headers = {
+            "Authorization": f"Bearer {openai_key}",
+            "Content-Type": "application/json"
+        }
+        
+        url = "https://api.openai.com/v1/chat/completions"
+    else:
+        # Use local LLM
+        payload = {
+            "model": MODEL,
+            "messages": messages,
+            "stream": True,
+            "temperature": 0.7,
+            "max_tokens": 150
+        }
+        headers = {}
+        url = LLM_SERVER_URL
     
     try:
-        response = requests.post(LLM_SERVER_URL, json=payload, timeout=(5, 60), stream=True)
+        if headers:
+            response = requests.post(url, json=payload, headers=headers, timeout=(5, 60), stream=True)
+        else:
+            response = requests.post(url, json=payload, timeout=(5, 60), stream=True)
         response.raise_for_status()
         
         for line in response.iter_lines(decode_unicode=True):

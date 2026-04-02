@@ -206,20 +206,42 @@ def api_chat_cloud():
 def api_chat_stream():
     user = request.args.get('user', '')
     # Accept optional history as JSON-encoded query parameter
+    # New format: {"local": [...], "cloud": [...]} for separate histories
+    # Old format: [...] for shared history (backwards compatible)
     history_param = request.args.get('history', '')
+    history_local = []
+    history_cloud = []
+    
     if history_param:
         try:
-            history = json.loads(history_param)
-            # Append current user message if not already in history
-            if user and (not history or history[-1].get('content') != user):
-                history.append({'role': 'user', 'content': user})
+            parsed_history = json.loads(history_param)
+            if isinstance(parsed_history, dict) and ('local' in parsed_history or 'cloud' in parsed_history):
+                # New format with separate histories
+                history_local = parsed_history.get('local', [])
+                history_cloud = parsed_history.get('cloud', [])
+            elif isinstance(parsed_history, list):
+                # Old format - use same history for both (backwards compatible)
+                history_local = parsed_history
+                history_cloud = parsed_history
         except Exception:
-            history = [{'role': 'user', 'content': user}] if user else []
-    else:
-        history = [{'role': 'user', 'content': user}] if user else []
+            pass
+    
+    # Append current user message to each history if not already present
+    if user:
+        if not history_local or history_local[-1].get('content') != user:
+            history_local = list(history_local) + [{'role': 'user', 'content': user}]
+        if not history_cloud or history_cloud[-1].get('content') != user:
+            history_cloud = list(history_cloud) + [{'role': 'user', 'content': user}]
+    
+    # Create fallback if no user message and no history
+    if not history_local:
+        history_local = [{'role': 'user', 'content': user}] if user else []
+    if not history_cloud:
+        history_cloud = [{'role': 'user', 'content': user}] if user else []
     
     # Determine if we have previous conversation context (more than just the current message)
-    has_context = len(history) > 1
+    has_context_local = len(history_local) > 1
+    has_context_cloud = len(history_cloud) > 1
 
     def generate():
         # Stream tokens from both models concurrently and process deltas as they arrive.
@@ -241,17 +263,17 @@ def api_chat_stream():
                 sys_prompt = llm_api.local_llm.get_system_prompt(filler_mode) if hasattr(llm_api.local_llm, 'get_system_prompt') else (llm_api.local_llm.SYSTEM_PROMPT if hasattr(llm_api.local_llm, 'SYSTEM_PROMPT') else '')
                 
                 # Build messages with explicit context marking if history exists
-                if has_context and len(history) > 1:
+                if has_context_local and len(history_local) > 1:
                     # Add context marker after system prompt
-                    context_msgs = history[-getattr(llm_api.local_llm, 'MAX_HISTORY', 8):-1]  # All but current message
-                    current_msg = history[-1:]  # Just the current message
+                    context_msgs = history_local[-getattr(llm_api.local_llm, 'MAX_HISTORY', 8):-1]  # All but current message
+                    current_msg = history_local[-1:]  # Just the current message
                     
                     # Create enhanced system prompt with context indicator
                     enhanced_prompt = sys_prompt + "\n\nNote: The following conversation history is provided for context. The user's current request is at the end."
                     
                     msgs = [{'role': 'system', 'content': enhanced_prompt}] + context_msgs + current_msg
                 else:
-                    msgs = [{'role': 'system', 'content': sys_prompt}] + (history[-getattr(llm_api.local_llm, 'MAX_HISTORY', 8):] if history else [])
+                    msgs = [{'role': 'system', 'content': sys_prompt}] + (history_local[-getattr(llm_api.local_llm, 'MAX_HISTORY', 8):] if history_local else [])
                 
                 payload = {'model': getattr(llm_api.local_llm, 'MODEL', None) or 'local', 'messages': msgs, 'stream': True, 'temperature': 0}
                 url = getattr(llm_api.local_llm, 'LLM_SERVER_URL', None)
@@ -304,25 +326,32 @@ def api_chat_stream():
                 # construct messages with dynamic system prompt based on filler mode
                 with SETTINGS_LOCK:
                     filler_mode = SETTINGS.get('filler_mode', 'auto')
-                llm_module = llm_api.llm_helper if getattr(llm_api, 'llm_helper', None) else llm_api.local_llm
-                sys_prompt = llm_module.get_system_prompt(filler_mode) if hasattr(llm_module, 'get_system_prompt') else (llm_module.SYSTEM_PROMPT if hasattr(llm_module, 'SYSTEM_PROMPT') else '')
+                # Cloud worker gets system prompt from llm_helper (same as local_llm module)
+                llm_module = getattr(llm_api, 'llm_helper', None) or getattr(llm_api, 'local_llm', None)
+                if llm_module:
+                    sys_prompt = llm_module.get_system_prompt(filler_mode) if hasattr(llm_module, 'get_system_prompt') else (llm_module.SYSTEM_PROMPT if hasattr(llm_module, 'SYSTEM_PROMPT') else '')
+                else:
+                    sys_prompt = "You are Butler, a helpful AI assistant."
                 
                 # Build messages with explicit context marking if history exists
-                max_hist = llm_api.llm_helper.MAX_HISTORY if getattr(llm_api, 'llm_helper', None) and hasattr(llm_api.llm_helper, 'MAX_HISTORY') else (llm_api.local_llm.MAX_HISTORY if getattr(llm_api, 'local_llm', None) and hasattr(llm_api.local_llm, 'MAX_HISTORY') else 8)
+                max_hist = 8
+                if llm_module and hasattr(llm_module, 'MAX_HISTORY'):
+                    max_hist = llm_module.MAX_HISTORY
                 
-                if has_context and len(history) > 1:
+                if has_context_cloud and len(history_cloud) > 1:
                     # Add context marker after system prompt
-                    context_msgs = history[-max_hist:-1]  # All but current message
-                    current_msg = history[-1:]  # Just the current message
+                    context_msgs = history_cloud[-max_hist:-1]  # All but current message
+                    current_msg = history_cloud[-1:]  # Just the current message
                     
                     # Create enhanced system prompt with context indicator
                     enhanced_prompt = sys_prompt + "\n\nNote: The following conversation history is provided for context. The user's current request is at the end."
                     
                     msgs = [{'role': 'system', 'content': enhanced_prompt}] + context_msgs + current_msg
                 else:
-                    msgs = [{'role': 'system', 'content': sys_prompt}] + (history[-max_hist:] if history else [])
+                    msgs = [{'role': 'system', 'content': sys_prompt}] + (history_cloud[-max_hist:] if history_cloud else [])
                 
                 payload = {'model': 'gpt-5.2', 'messages': msgs, 'temperature': 0, 'stream': True}
+                print(f"[STREAM_WORKER_CLOUD] Calling OpenAI API at {llm_api.OPENAI_URL}")
                 headers = {'Authorization': f'Bearer {llm_api.OPENAI_KEY}', 'Content-Type': 'application/json'}
                 resp = requests.post(llm_api.OPENAI_URL, json=payload, headers=headers, timeout=(5, 60), stream=True)
                 accumulated = ''
@@ -441,7 +470,9 @@ def api_chat_stream():
                                     def _apply_and_enqueue(parsed_obj, target_who, sid):
                                         try:
                                             t0 = time.time()
-                                            last_text = history[-1]['content'] if history else (user or '')
+                                            # Use the appropriate history based on which model is calling
+                                            current_history = history_local if target_who == 'local' else history_cloud
+                                            last_text = current_history[-1]['content'] if current_history else (user or '')
                                             
                                             # Check for filler and emit it immediately before executing tool
                                             filler = parsed_obj.get('filler', '').strip()
@@ -459,8 +490,9 @@ def api_chat_stream():
                                                     
                                                     if weather_data.get('ok'):
                                                         # Stream the weather summary from dedicated LLM
+                                                        # Use the appropriate LLM source based on which worker called it
                                                         accumulated = ''
-                                                        for token in weather.stream_weather_summary(weather_data, last_text):
+                                                        for token in weather.stream_weather_summary(weather_data, last_text, source=target_who):
                                                             accumulated += token
                                                             q.put({'who': target_who, 'type': 'delta', 'text': token, 'ts': int((time.time()-t0)*1000), 'stream_id': sid})
                                                         
@@ -487,6 +519,8 @@ def api_chat_stream():
                                                 pass
                                     thr = threading.Thread(target=_apply_and_enqueue, args=(parsed, who, stream_id), daemon=True)
                                     thr.start()
+                                    # IMPORTANT: Clear the buffer for this model to prevent text before tool call from being synthesized
+                                    buffers[who] = ''
                                 else:
                                     # not valid toolcall JSON — treat candidate as spoken text
                                     out_chars.append(candidate)
